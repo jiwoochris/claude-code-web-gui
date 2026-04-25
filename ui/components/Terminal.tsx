@@ -1,0 +1,361 @@
+"use client";
+
+import { useCallback, useEffect, useRef, useState } from "react";
+import { useRouter } from "next/navigation";
+
+type Status = "connecting" | "open" | "retrying" | "closed" | "error";
+
+interface Props {
+  name: string;
+}
+
+const MAX_RETRIES = 5;
+const RETRY_BASE_MS = 800;
+
+function wsUrlFor(name: string): string {
+  if (typeof window === "undefined") return "";
+  const explicit = process.env.NEXT_PUBLIC_WS_URL;
+  if (explicit) {
+    const base = explicit.replace(/\/$/, "");
+    return `${base}/ws/${encodeURIComponent(name)}`;
+  }
+  const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
+  const host = window.location.hostname;
+  const port = process.env.NEXT_PUBLIC_WS_PORT ?? "3001";
+  return `${proto}//${host}:${port}/ws/${encodeURIComponent(name)}`;
+}
+
+export function Terminal({ name }: Props) {
+  const router = useRouter();
+  const hostRef = useRef<HTMLDivElement | null>(null);
+  const termRef = useRef<import("@xterm/xterm").Terminal | null>(null);
+  const fitRef = useRef<import("@xterm/addon-fit").FitAddon | null>(null);
+  const wsRef = useRef<WebSocket | null>(null);
+  const retryRef = useRef(0);
+  const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pingTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const aliveRef = useRef(true);
+
+  const [status, setStatus] = useState<Status>("connecting");
+  const [size, setSize] = useState<{ cols: number; rows: number }>({
+    cols: 120,
+    rows: 40,
+  });
+  const [banner, setBanner] = useState<string | null>(null);
+
+  const sendResize = useCallback(() => {
+    const ws = wsRef.current;
+    const term = termRef.current;
+    if (!ws || !term || ws.readyState !== WebSocket.OPEN) return;
+    ws.send(JSON.stringify({ type: "resize", cols: term.cols, rows: term.rows }));
+  }, []);
+
+  const doFit = useCallback(() => {
+    const fit = fitRef.current;
+    const term = termRef.current;
+    if (!fit || !term) return;
+    try {
+      fit.fit();
+      setSize({ cols: term.cols, rows: term.rows });
+      sendResize();
+    } catch {
+      /* ignore resize errors pre-mount */
+    }
+  }, [sendResize]);
+
+  const connect = useCallback(async () => {
+    if (!aliveRef.current) return;
+    const term = termRef.current;
+    if (!term) return;
+
+    setStatus(retryRef.current > 0 ? "retrying" : "connecting");
+
+    const url = wsUrlFor(name);
+    let ws: WebSocket;
+    try {
+      ws = new WebSocket(url);
+    } catch {
+      setStatus("error");
+      setBanner("WebSocket 연결을 열 수 없습니다.");
+      return;
+    }
+    ws.binaryType = "arraybuffer";
+    wsRef.current = ws;
+
+    ws.onopen = () => {
+      retryRef.current = 0;
+      setStatus("open");
+      setBanner(null);
+      sendResize();
+      if (pingTimerRef.current) clearInterval(pingTimerRef.current);
+      pingTimerRef.current = setInterval(() => {
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: "ping" }));
+        }
+      }, 30_000);
+    };
+
+    ws.onmessage = (ev) => {
+      const t = termRef.current;
+      if (!t) return;
+      if (typeof ev.data === "string") {
+        // Only object-shaped payloads are control messages (ping/pong).
+        // Anything else — including bare JSON values like a single digit
+        // echoed back from the pty — must flow through to the terminal.
+        if (ev.data.startsWith("{")) {
+          try {
+            const msg = JSON.parse(ev.data);
+            if (msg?.type === "ping" || msg?.type === "pong") return;
+          } catch {
+            /* fall through and write as raw text */
+          }
+        }
+        t.write(ev.data);
+      } else if (ev.data instanceof ArrayBuffer) {
+        t.write(new Uint8Array(ev.data));
+      } else if (ev.data instanceof Blob) {
+        ev.data.arrayBuffer().then((buf) => t.write(new Uint8Array(buf)));
+      }
+    };
+
+    ws.onerror = () => {
+      // onclose will follow — don't duplicate retries here.
+    };
+
+    ws.onclose = (ev) => {
+      if (pingTimerRef.current) {
+        clearInterval(pingTimerRef.current);
+        pingTimerRef.current = null;
+      }
+      if (!aliveRef.current) return;
+
+      if (ev.code === 4401) {
+        setStatus("error");
+        setBanner("인증이 만료되었습니다. 다시 로그인하세요.");
+        router.replace(`/login?next=${encodeURIComponent(`/s/${name}`)}`);
+        return;
+      }
+      if (ev.code === 4404) {
+        // Session is gone (tmux reported "can't find session"). This is the
+        // natural terminal state after Ctrl-D, `exit`, or an external kill —
+        // not an error condition from the user's perspective.
+        setStatus("closed");
+        setBanner("세션이 종료되었습니다.");
+        return;
+      }
+      if (ev.code === 4400) {
+        setStatus("error");
+        setBanner("세션 이름이 올바르지 않습니다.");
+        return;
+      }
+
+      // 4000 = tmux attach exited cleanly (C-b d, shell exit, etc.). Try one
+      // quick reattach in case the session survived; the follow-up will land
+      // in 4404 if it didn't.
+      const cleanExit = ev.code === 4000;
+      retryRef.current += 1;
+      if (retryRef.current > MAX_RETRIES) {
+        setStatus("closed");
+        setBanner(
+          cleanExit
+            ? "세션 연결이 종료되었습니다."
+            : "연결이 끊어졌습니다. '재연결'을 눌러 다시 시도하세요.",
+        );
+        return;
+      }
+      const delay = cleanExit
+        ? 300
+        : Math.min(RETRY_BASE_MS * 2 ** (retryRef.current - 1), 8_000);
+      setStatus("retrying");
+      setBanner(
+        cleanExit
+          ? `세션이 detach 되어 다시 연결 중… (${retryRef.current}/${MAX_RETRIES})`
+          : `⚠ 연결이 끊어졌습니다. 재연결 중… (${retryRef.current}/${MAX_RETRIES})`,
+      );
+      retryTimerRef.current = setTimeout(() => {
+        if (aliveRef.current) void connect();
+      }, delay);
+    };
+  }, [name, router, sendResize]);
+
+  useEffect(() => {
+    aliveRef.current = true;
+    let cancelled = false;
+
+    (async () => {
+      const host = hostRef.current;
+      if (!host) return;
+
+      const { Terminal: XTerm } = await import("@xterm/xterm");
+      const { FitAddon } = await import("@xterm/addon-fit");
+      // xterm.css is injected globally via the import below.
+      await import("@xterm/xterm/css/xterm.css");
+
+      if (cancelled) return;
+
+      const term = new XTerm({
+        convertEol: false,
+        cursorBlink: true,
+        fontFamily:
+          'ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace',
+        fontSize: 13,
+        lineHeight: 1.15,
+        allowProposedApi: true,
+        scrollback: 10_000,
+        theme: {
+          background: "#0c0f14",
+          foreground: "#e6e8eb",
+          cursor: "#f0a020",
+          cursorAccent: "#0c0f14",
+          selectionBackground: "rgba(240, 160, 32, 0.28)",
+        },
+      });
+      const fit = new FitAddon();
+      term.loadAddon(fit);
+      term.open(host);
+
+      try {
+        const { WebglAddon } = await import("@xterm/addon-webgl");
+        const webgl = new WebglAddon();
+        webgl.onContextLoss(() => webgl.dispose());
+        term.loadAddon(webgl);
+      } catch {
+        /* WebGL not available; fall back to canvas/DOM renderer */
+      }
+
+      termRef.current = term;
+      fitRef.current = fit;
+
+      // Shift+Enter inserts a newline without submitting.
+      // Ctrl+V pastes from the browser clipboard (macOS Cmd+V still flows
+      // through the native paste event, so we only intercept Ctrl+V here).
+      // paste() respects bracketed-paste mode when the app has enabled it.
+      term.attachCustomKeyEventHandler((ev) => {
+        if (ev.type !== "keydown") return true;
+
+        if (
+          ev.key === "Enter" &&
+          ev.shiftKey &&
+          !ev.ctrlKey &&
+          !ev.altKey &&
+          !ev.metaKey
+        ) {
+          termRef.current?.paste("\n");
+          return false;
+        }
+
+        if (
+          ev.ctrlKey &&
+          !ev.metaKey &&
+          !ev.altKey &&
+          (ev.key === "v" || ev.key === "V")
+        ) {
+          void (async () => {
+            try {
+              const text = await navigator.clipboard.readText();
+              if (text) termRef.current?.paste(text);
+            } catch {
+              /* clipboard unavailable or denied */
+            }
+          })();
+          return false;
+        }
+
+        return true;
+      });
+
+      term.onData((data) => {
+        const ws = wsRef.current;
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(new TextEncoder().encode(data));
+        }
+      });
+
+      term.onResize(({ cols, rows }) => {
+        setSize({ cols, rows });
+        const ws = wsRef.current;
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: "resize", cols, rows }));
+        }
+      });
+
+      doFit();
+      const ro = new ResizeObserver(() => doFit());
+      ro.observe(host);
+
+      await connect();
+
+      return () => {
+        ro.disconnect();
+      };
+    })();
+
+    return () => {
+      cancelled = true;
+      aliveRef.current = false;
+      if (retryTimerRef.current) clearTimeout(retryTimerRef.current);
+      if (pingTimerRef.current) clearInterval(pingTimerRef.current);
+      try {
+        wsRef.current?.close();
+      } catch {
+        /* noop */
+      }
+      wsRef.current = null;
+      try {
+        termRef.current?.dispose();
+      } catch {
+        /* noop */
+      }
+      termRef.current = null;
+      fitRef.current = null;
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [name]);
+
+  const reconnect = () => {
+    retryRef.current = 0;
+    setBanner(null);
+    try {
+      wsRef.current?.close();
+    } catch {
+      /* noop */
+    }
+    void connect();
+  };
+
+  const dotClass =
+    status === "open"
+      ? "dot connected"
+      : status === "error"
+        ? "dot error"
+        : "dot";
+
+  return (
+    <div className="term-page">
+      <header className="term-header">
+        <span className={dotClass} aria-label={`연결 상태: ${status}`} />
+        <span className="name">{name}</span>
+        <span className="size">
+          {size.cols}×{size.rows}
+        </span>
+        <span className="spacer" />
+        <button onClick={reconnect} title="WebSocket 재연결">
+          🔌 재연결
+        </button>
+      </header>
+
+      {banner && (
+        <div className={`term-banner${status === "open" ? " info" : ""}`}>
+          <span>{banner}</span>
+          <button className="dismiss" onClick={() => setBanner(null)} aria-label="닫기">
+            ×
+          </button>
+        </div>
+      )}
+
+      <div className="term-body">
+        <div ref={hostRef} className="xterm-host" />
+      </div>
+    </div>
+  );
+}

@@ -1,0 +1,27 @@
+{
+  "name": "claude-code-web-gui-ws",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "dist/index.js",
+  "packageManager": "yarn@4.9.4",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx watch src/index.ts",
+    "typecheck": "tsc --noEmit",
+    "postinstall": "node scripts/fix-pty-helper.js"
+  },
+  "dependencies": {
+    "cookie": "^1.0.2",
+    "iron-session": "^8.0.4",
+    "node-pty": "^1.0.0",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/ws": "^8.5.13",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.0"
+  }
+}

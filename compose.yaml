@@ -1,0 +1,60 @@
+# Claude Code Web GUI — single-host (Linux) deployment.
+#
+# ⚠ This compose file is for **Linux hosts only**. On macOS with Docker
+# Desktop the Linux VM's kernel cannot talk to the host's tmux Unix socket
+# even if the file is visible through a bind mount — `connect()` returns
+# ECONNREFUSED and tmux will then auto-create its own server at the same
+# path, silently overwriting the host's socket. For that reason we do NOT
+# bind-mount the tmux socket directory here; on Linux you can safely
+# re-add it (see commented line below).
+#
+# For local development on macOS, run the UI and ws-gateway natively
+# against the host tmux (see README "로컬 개발" 섹션).
+
+services:
+  ui:
+    build:
+      context: ./ui
+      args:
+        # Client needs to know the public WS port at build time (baked into JS).
+        NEXT_PUBLIC_WS_PORT: "2001"
+    env_file: .env
+    environment:
+      - NODE_ENV=production
+      - WORKSPACE_ROOT=/workspace
+    ports:
+      - "2000:3000"
+    volumes:
+      # Expose the host project root to the read-only file viewer (§12).
+      # Replace the left-hand path with your actual projects directory.
+      - /Users/sigmine/projects:/workspace:ro
+      # (Linux only) Share the host tmux socket dir so tmux CLI inside the
+      # container can talk to the host tmux server. DO NOT enable on macOS —
+      # Docker Desktop cannot bridge Unix sockets across its VM boundary and
+      # the container tmux will clobber the host's socket file.
+      # - /tmp/tmux-$UID:/tmp/tmux-$UID
+    restart: unless-stopped
+    # Run as the host user so tmux socket / workspace perms line up.
+    user: "501:20"
+
+  ws:
+    build: ./ws-gateway
+    env_file: .env
+    environment:
+      - NODE_ENV=production
+    ports:
+      - "2001:3001"
+    # (Linux only) tmux socket share — see note above. Disabled on macOS.
+    # volumes:
+    #   - /tmp/tmux-$UID:/tmp/tmux-$UID
+    restart: unless-stopped
+    user: "501:20"
+
+  # Optional: uncomment to front both services with a single origin.
+  # nginx:
+  #   image: nginx:1.27-alpine
+  #   ports: ["80:80"]
+  #   volumes:
+  #     - ./nginx.conf:/etc/nginx/nginx.conf:ro
+  #   depends_on: [ui, ws]
+  #   restart: unless-stopped

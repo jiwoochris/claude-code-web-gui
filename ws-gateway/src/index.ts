@@ -1,8 +1,15 @@
 import http from "node:http";
+import { execFile } from "node:child_process";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { promisify } from "node:util";
 import { WebSocketServer, type WebSocket } from "ws";
 import * as pty from "node-pty";
 import { unsealData } from "iron-session";
 import { parse as parseCookie } from "cookie";
+
+const execFileP = promisify(execFile);
 
 // ── 상수 ──────────────────────────────────────────────────────
 // Port is fixed at 3001 by design (§10.1); `PORT` env exists only so devs
@@ -74,6 +81,120 @@ const server = http.createServer((req, res) => {
   res.writeHead(404, { "content-type": "text/plain" });
   res.end("Not Found");
 });
+
+// ── Claude Code transcript briefing ───────────────────────────
+// Resolve the assistant's most recent text turn for `sessionName` by:
+//   1. Asking tmux for the pane's current working directory.
+//   2. Translating that cwd into Claude's project-encoded directory under
+//      ~/.claude/projects/ (Claude replaces "/" with "-" verbatim).
+//   3. Reading the most recently modified .jsonl in that directory and
+//      walking it backward for the last `assistant` message with text content.
+// Returns null when any step fails — the UI falls back to the terminal scrape.
+const CLAUDE_PROJECTS_DIR = path.join(
+  process.env.CLAUDE_PROJECTS_DIR ?? path.join(os.homedir(), ".claude", "projects"),
+);
+
+async function tmuxPanePath(sessionName: string): Promise<string | null> {
+  try {
+    const { stdout } = await execFileP("tmux", [
+      "display-message",
+      "-p",
+      "-t",
+      sessionName,
+      "#{pane_current_path}",
+    ]);
+    const p = stdout.trim();
+    return p.length > 0 ? p : null;
+  } catch {
+    return null;
+  }
+}
+
+function encodeProjectDir(cwd: string): string {
+  // Claude Code's encoding: replace every "/" with "-". A leading "/"
+  // therefore becomes a leading "-", matching the on-disk layout.
+  return cwd.replace(/\//g, "-");
+}
+
+async function findLatestJsonl(projectDir: string): Promise<string | null> {
+  let entries: string[];
+  try {
+    entries = await fs.readdir(projectDir);
+  } catch {
+    return null;
+  }
+  let bestPath: string | null = null;
+  let bestMtime = -Infinity;
+  for (const name of entries) {
+    if (!name.endsWith(".jsonl")) continue;
+    const full = path.join(projectDir, name);
+    try {
+      const st = await fs.stat(full);
+      if (!st.isFile()) continue;
+      if (st.mtimeMs > bestMtime) {
+        bestMtime = st.mtimeMs;
+        bestPath = full;
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+  return bestPath;
+}
+
+type AssistantContent =
+  | { type: "text"; text?: string }
+  | { type: string; [k: string]: unknown };
+
+function extractAssistantText(line: string): string | null {
+  let obj: { type?: string; message?: { role?: string; content?: AssistantContent[] | string } };
+  try {
+    obj = JSON.parse(line);
+  } catch {
+    return null;
+  }
+  if (obj.type !== "assistant") return null;
+  const content = obj.message?.content;
+  if (typeof content === "string") return content.trim() || null;
+  if (!Array.isArray(content)) return null;
+  const parts: string[] = [];
+  for (const c of content) {
+    if (c && typeof c === "object" && c.type === "text" && typeof c.text === "string") {
+      parts.push(c.text);
+    }
+  }
+  const joined = parts.join("\n").trim();
+  return joined.length > 0 ? joined : null;
+}
+
+async function readLastAssistantText(jsonlPath: string): Promise<string | null> {
+  let buf: string;
+  try {
+    buf = await fs.readFile(jsonlPath, "utf8");
+  } catch {
+    return null;
+  }
+  const lines = buf.split("\n");
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const ln = lines[i];
+    if (!ln) continue;
+    const text = extractAssistantText(ln);
+    if (text) return text;
+  }
+  return null;
+}
+
+async function getBriefingText(sessionName: string): Promise<{ text: string | null; reason?: string }> {
+  const cwd = await tmuxPanePath(sessionName);
+  if (!cwd) return { text: null, reason: "no_pane_path" };
+  const projectDir = path.join(CLAUDE_PROJECTS_DIR, encodeProjectDir(cwd));
+  const jsonl = await findLatestJsonl(projectDir);
+  if (!jsonl) return { text: null, reason: "no_transcript" };
+  const text = await readLastAssistantText(jsonl);
+  if (!text) return { text: null, reason: "no_assistant_text" };
+  return { text };
+}
+// ──────────────────────────────────────────────────────────────
 
 const wss = new WebSocketServer({ noServer: true });
 
@@ -204,6 +325,39 @@ wss.on("connection", (ws: WebSocket, req: http.IncomingMessage, sessionName: str
       }
       if (msg.type === "ping") {
         if (ws.readyState === ws.OPEN) ws.send(JSON.stringify({ type: "pong" }));
+        return;
+      }
+      if (msg.type === "briefing") {
+        const reqId = (msg as { id?: string }).id;
+        void getBriefingText(sessionName)
+          .then((res) => {
+            if (ws.readyState !== ws.OPEN) return;
+            ws.send(
+              JSON.stringify({
+                type: "briefing",
+                id: reqId,
+                text: res.text,
+                reason: res.reason,
+              }),
+            );
+          })
+          .catch((err) => {
+            log("warn", "ws.briefing.error", {
+              ip,
+              sessionName,
+              message: (err as Error).message,
+            });
+            if (ws.readyState === ws.OPEN) {
+              ws.send(
+                JSON.stringify({
+                  type: "briefing",
+                  id: reqId,
+                  text: null,
+                  reason: "error",
+                }),
+              );
+            }
+          });
         return;
       }
     } catch {

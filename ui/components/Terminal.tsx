@@ -43,6 +43,11 @@ export function Terminal({ name }: Props) {
   });
   const [banner, setBanner] = useState<string | null>(null);
   const [speaking, setSpeaking] = useState(false);
+  const briefingPendingRef = useRef<{
+    id: string;
+    resolve: (text: string | null) => void;
+    timer: ReturnType<typeof setTimeout>;
+  } | null>(null);
 
   const sendResize = useCallback(() => {
     const ws = wsRef.current;
@@ -107,6 +112,15 @@ export function Terminal({ name }: Props) {
           try {
             const msg = JSON.parse(ev.data);
             if (msg?.type === "ping" || msg?.type === "pong") return;
+            if (msg?.type === "briefing") {
+              const pending = briefingPendingRef.current;
+              if (pending && (!msg.id || msg.id === pending.id)) {
+                clearTimeout(pending.timer);
+                briefingPendingRef.current = null;
+                pending.resolve(typeof msg.text === "string" ? msg.text : null);
+              }
+              return;
+            }
           } catch {
             /* fall through and write as raw text */
           }
@@ -525,7 +539,49 @@ export function Terminal({ name }: Props) {
     return cleaned.slice(0, 1200);
   }, []);
 
-  const toggleBriefing = useCallback(() => {
+  const requestTranscriptBriefing = useCallback((): Promise<string | null> => {
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return Promise.resolve(null);
+    const prev = briefingPendingRef.current;
+    if (prev) {
+      clearTimeout(prev.timer);
+      prev.resolve(null);
+      briefingPendingRef.current = null;
+    }
+    return new Promise<string | null>((resolve) => {
+      const id =
+        (typeof crypto !== "undefined" && "randomUUID" in crypto
+          ? crypto.randomUUID()
+          : Math.random().toString(36).slice(2));
+      const timer = setTimeout(() => {
+        if (briefingPendingRef.current?.id === id) {
+          briefingPendingRef.current = null;
+          resolve(null);
+        }
+      }, 3000);
+      briefingPendingRef.current = { id, resolve, timer };
+      try {
+        ws.send(JSON.stringify({ type: "briefing", id }));
+      } catch {
+        clearTimeout(timer);
+        briefingPendingRef.current = null;
+        resolve(null);
+      }
+    });
+  }, []);
+
+  const speakText = useCallback((text: string) => {
+    const synth = window.speechSynthesis;
+    const utter = new SpeechSynthesisUtterance(text);
+    utter.lang = "ko-KR";
+    utter.rate = 1.05;
+    utter.onend = () => setSpeaking(false);
+    utter.onerror = () => setSpeaking(false);
+    setSpeaking(true);
+    synth.speak(utter);
+  }, []);
+
+  const toggleBriefing = useCallback(async () => {
     if (typeof window === "undefined" || !("speechSynthesis" in window)) {
       setBanner("이 브라우저는 음성 합성을 지원하지 않습니다.");
       return;
@@ -536,24 +592,25 @@ export function Terminal({ name }: Props) {
       setSpeaking(false);
       return;
     }
-    const text = extractLastAssistantText();
+
+    const transcriptText = await requestTranscriptBriefing();
+    const text = transcriptText ?? extractLastAssistantText();
     if (!text) {
       setBanner("읽을 답변을 찾지 못했습니다.");
       return;
     }
-    const utter = new SpeechSynthesisUtterance(text);
-    utter.lang = "ko-KR";
-    utter.rate = 1.05;
-    utter.onend = () => setSpeaking(false);
-    utter.onerror = () => setSpeaking(false);
-    setSpeaking(true);
-    synth.speak(utter);
-  }, [extractLastAssistantText]);
+    speakText(text.slice(0, 4000));
+  }, [extractLastAssistantText, requestTranscriptBriefing, speakText]);
 
   useEffect(() => {
     return () => {
       if (typeof window !== "undefined" && "speechSynthesis" in window) {
         window.speechSynthesis.cancel();
+      }
+      const pending = briefingPendingRef.current;
+      if (pending) {
+        clearTimeout(pending.timer);
+        briefingPendingRef.current = null;
       }
     };
   }, []);

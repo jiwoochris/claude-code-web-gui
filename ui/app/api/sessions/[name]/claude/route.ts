@@ -36,9 +36,13 @@ export async function POST(
       // before injecting "/clear". Esc cancels in-progress streaming and
       // clears the prompt buffer; without it we'd just append to the user's
       // pending text. Two presses cover the "Esc-to-cancel-stream, Esc again
-      // to clear input" path.
+      // to clear input" path. Then a short pause lets the TUI re-render an
+      // empty input before the slash command + Enter arrive together as one
+      // batch (otherwise Enter can land while the input is still settling
+      // and the TUI ignores it).
       await sendKey(name, "Escape");
       await sendKey(name, "Escape");
+      await new Promise((r) => setTimeout(r, 120));
       await sendLine(name, "/clear");
     }
     log.info("sessions.claude", { name, command: cmd, action });

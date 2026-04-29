@@ -77,12 +77,12 @@ export async function getPaneCommand(name: string): Promise<string | null> {
   }
 }
 
-// Send literal text + Enter into a tmux session. We split into two send-keys
-// calls so tmux interprets `Enter` as a literal carriage return rather than
-// trying to lex it inside the literal text.
+// Send literal text + Enter into a tmux session. tmux's send-keys can take
+// the literal text and the `Enter` key in a single invocation; that delivers
+// them as one contiguous batch to the pty, so TUIs like Claude Code don't
+// race between displaying the typed text and acting on the submit key.
 export async function sendLine(name: string, text: string): Promise<void> {
-  await run("tmux", ["send-keys", "-t", name, text], { timeout: 3000 });
-  await run("tmux", ["send-keys", "-t", name, "Enter"], { timeout: 3000 });
+  await run("tmux", ["send-keys", "-t", name, text, "Enter"], { timeout: 3000 });
 }
 
 export async function sendKey(name: string, key: string): Promise<void> {

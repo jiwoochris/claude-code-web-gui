@@ -147,14 +147,23 @@ type AssistantContent =
   | { type: string; [k: string]: unknown };
 
 function extractAssistantText(line: string): string | null {
-  let obj: { type?: string; message?: { role?: string; content?: AssistantContent[] | string } };
+  let obj: {
+    message?: {
+      type?: string;
+      role?: string;
+      content?: AssistantContent[] | string;
+    };
+  };
   try {
     obj = JSON.parse(line);
   } catch {
     return null;
   }
-  if (obj.type !== "assistant") return null;
-  const content = obj.message?.content;
+  const message = obj.message;
+  if (!message || message.type !== "message" || message.role !== "assistant") {
+    return null;
+  }
+  const content = message.content;
   if (typeof content === "string") return content.trim() || null;
   if (!Array.isArray(content)) return null;
   const parts: string[] = [];

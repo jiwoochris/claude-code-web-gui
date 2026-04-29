@@ -45,9 +45,9 @@ export async function listSessions(): Promise<TmuxSession[]> {
   }
 }
 
-export async function newSession(name: string): Promise<void> {
-  const cwd = process.env.WORKSPACE_ROOT ?? process.env.HOME ?? "/";
-  await run("tmux", ["new-session", "-d", "-s", name, "-c", cwd], { timeout: 3000 });
+export async function newSession(name: string, cwd?: string): Promise<void> {
+  const startDir = cwd ?? process.env.WORKSPACE_ROOT ?? process.env.HOME ?? "/";
+  await run("tmux", ["new-session", "-d", "-s", name, "-c", startDir], { timeout: 3000 });
 }
 
 export async function killSession(name: string): Promise<void> {
@@ -61,4 +61,47 @@ export async function hasSession(name: string): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+export async function getPaneCommand(name: string): Promise<string | null> {
+  try {
+    const { stdout } = await run(
+      "tmux",
+      ["display-message", "-p", "-t", name, "#{pane_current_command}"],
+      { timeout: 3000 },
+    );
+    const cmd = stdout.trim();
+    return cmd.length > 0 ? cmd : null;
+  } catch {
+    return null;
+  }
+}
+
+// Send literal text + Enter into a tmux session. We split into two send-keys
+// calls so tmux interprets `Enter` as a literal carriage return rather than
+// trying to lex it inside the literal text.
+export async function sendLine(name: string, text: string): Promise<void> {
+  await run("tmux", ["send-keys", "-t", name, text], { timeout: 3000 });
+  await run("tmux", ["send-keys", "-t", name, "Enter"], { timeout: 3000 });
+}
+
+const SHELL_COMMANDS = new Set([
+  "bash",
+  "zsh",
+  "sh",
+  "fish",
+  "dash",
+  "ash",
+  "ksh",
+  "tcsh",
+  "csh",
+  "nu",
+  "pwsh",
+  "powershell",
+]);
+
+export function isShellCommand(cmd: string | null): boolean {
+  if (!cmd) return false;
+  const c = cmd.replace(/^-/, "").toLowerCase();
+  return SHELL_COMMANDS.has(c);
 }

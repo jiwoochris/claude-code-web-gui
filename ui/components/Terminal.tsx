@@ -43,6 +43,7 @@ export function Terminal({ name }: Props) {
   });
   const [banner, setBanner] = useState<string | null>(null);
   const [speaking, setSpeaking] = useState(false);
+  const [claudeBusy, setClaudeBusy] = useState(false);
   const briefingPendingRef = useRef<{
     id: string;
     resolve: (text: string | null) => void;
@@ -581,6 +582,33 @@ export function Terminal({ name }: Props) {
     synth.speak(utter);
   }, []);
 
+  const toggleClaude = useCallback(async () => {
+    if (claudeBusy) return;
+    setClaudeBusy(true);
+    try {
+      const res = await fetch(
+        `/api/sessions/${encodeURIComponent(name)}/claude`,
+        { method: "POST", credentials: "include" },
+      );
+      if (res.status === 401) {
+        router.replace(`/login?next=${encodeURIComponent(`/s/${name}`)}`);
+        return;
+      }
+      if (res.status === 404) {
+        setBanner("세션을 찾을 수 없습니다.");
+        return;
+      }
+      if (!res.ok) {
+        setBanner("Claude 명령 전송에 실패했습니다.");
+        return;
+      }
+    } catch {
+      setBanner("네트워크 오류");
+    } finally {
+      setClaudeBusy(false);
+    }
+  }, [claudeBusy, name, router]);
+
   const toggleBriefing = useCallback(async () => {
     if (typeof window === "undefined" || !("speechSynthesis" in window)) {
       setBanner("이 브라우저는 음성 합성을 지원하지 않습니다.");
@@ -637,6 +665,14 @@ export function Terminal({ name }: Props) {
           aria-pressed={speaking}
         >
           {speaking ? "⏹ 정지" : "🔊 브리핑"}
+        </button>
+        <button
+          onClick={toggleClaude}
+          disabled={claudeBusy}
+          aria-busy={claudeBusy}
+          title="Claude Code 시작 또는 /clear"
+        >
+          🤖 Claude
         </button>
         <button onClick={reconnect} title="WebSocket 재연결">
           🔌 재연결

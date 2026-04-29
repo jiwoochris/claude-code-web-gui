@@ -277,6 +277,102 @@ input {
   color: var(--danger);
 }
 
+.dir-picker {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  padding: 6px 4px;
+  max-height: 220px;
+  overflow-y: auto;
+  font-size: 12px;
+}
+
+.dir-picker-label {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--fg-muted);
+  padding: 2px 6px 4px;
+}
+
+.dir-node {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  border-radius: 4px;
+  padding-right: 4px;
+}
+
+.dir-node.selected {
+  background: var(--accent-soft);
+}
+
+.dir-node.selected .dir-label .name {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.dir-node .twist {
+  flex: 0 0 auto;
+  width: 16px;
+  height: 22px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--fg-dim);
+  font-size: 10px;
+  border-radius: 3px;
+  background: transparent;
+  border: none;
+}
+
+.dir-node .twist:hover {
+  background: var(--bg-elev-2);
+  color: var(--fg);
+}
+
+.dir-node .dir-label {
+  flex: 1;
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 4px;
+  border-radius: 4px;
+  background: transparent;
+  border: none;
+  text-align: left;
+  color: var(--fg);
+  font-family: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.dir-node .dir-label:hover {
+  background: var(--bg-elev-2);
+}
+
+.dir-node .dir-label .icon {
+  width: 16px;
+  display: inline-flex;
+  justify-content: center;
+}
+
+.dir-node .dir-label .name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dir-empty {
+  font-size: 11px;
+  color: var(--fg-dim);
+  padding: 2px 4px 4px;
+}
+
 .lnb-sessions {
   flex: 1;
   overflow-y: auto;

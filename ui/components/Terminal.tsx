@@ -42,6 +42,7 @@ export function Terminal({ name }: Props) {
     rows: 40,
   });
   const [banner, setBanner] = useState<string | null>(null);
+  const [speaking, setSpeaking] = useState(false);
 
   const sendResize = useCallback(() => {
     const ws = wsRef.current;
@@ -226,10 +227,13 @@ export function Terminal({ name }: Props) {
       termRef.current = term;
       fitRef.current = fit;
 
-      // Shift+Enter inserts a newline without submitting.
-      // Ctrl+V pastes from the browser clipboard (macOS Cmd+V still flows
-      // through the native paste event, so we only intercept Ctrl+V here).
-      // paste() respects bracketed-paste mode when the app has enabled it.
+      // Shift+Enter sends ESC+CR (the same sequence native terminals like
+      // iTerm/Terminal.app emit for Alt/Shift+Enter). TUIs such as Claude
+      // Code treat this as "insert newline" while a bare CR still submits.
+      // A lone LF is dropped by some TUIs inside tmux, which is why the
+      // web GUI's old `\n` payload didn't work. Ctrl+C copies the current
+      // selection when there is one (otherwise it falls through as SIGINT).
+      // Ctrl+V pastes from the browser clipboard.
       term.attachCustomKeyEventHandler((ev) => {
         if (ev.type !== "keydown") return true;
 
@@ -240,7 +244,44 @@ export function Terminal({ name }: Props) {
           !ev.altKey &&
           !ev.metaKey
         ) {
-          termRef.current?.paste("\n");
+          const ws = wsRef.current;
+          if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(new TextEncoder().encode("\x1b\r"));
+          }
+          return false;
+        }
+
+        if (
+          ev.ctrlKey &&
+          !ev.metaKey &&
+          !ev.altKey &&
+          !ev.shiftKey &&
+          (ev.key === "c" || ev.key === "C") &&
+          termRef.current?.hasSelection()
+        ) {
+          const text = termRef.current.getSelection();
+          if (text) {
+            void navigator.clipboard.writeText(text).catch(() => {
+              /* clipboard unavailable or denied */
+            });
+          }
+          return false;
+        }
+
+        // Ctrl+Backspace deletes the previous word (sends ^W, U+0017).
+        // Browsers don't emit a character for Ctrl+Backspace, so xterm
+        // would otherwise drop it.
+        if (
+          ev.key === "Backspace" &&
+          ev.ctrlKey &&
+          !ev.metaKey &&
+          !ev.altKey &&
+          !ev.shiftKey
+        ) {
+          const ws = wsRef.current;
+          if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(new TextEncoder().encode("\x17"));
+          }
           return false;
         }
 
@@ -264,11 +305,66 @@ export function Terminal({ name }: Props) {
         return true;
       });
 
-      term.onData((data) => {
+      // IME composition handling. xterm.js's onData leaks intermediate
+      // composition state for some IMEs (Korean), so we own the
+      // composition-text send: on compositionend we ship the committed
+      // text ourselves (synchronously, while still on the same task as
+      // the keystroke) and drop xterm's later duplicate via a short-lived
+      // exact-match suppress.
+      //
+      // Why not just gate onData on `isComposing`: between two chained
+      // compositions (e.g. ㄴ ending "안" and starting "녕") the prior
+      // composition's deferred xterm send fires AFTER the new
+      // compositionstart re-arms the gate, so the gate would swallow
+      // every word's leading syllables — only the last syllable before a
+      // SPACE / word break would survive.
+      const textarea = (term as unknown as { textarea?: HTMLTextAreaElement })
+        .textarea;
+      let isComposing = false;
+      let lastComposed = "";
+      let suppressNext = "";
+      let suppressUntil = 0;
+
+      const sendRaw = (data: string) => {
         const ws = wsRef.current;
         if (ws && ws.readyState === WebSocket.OPEN) {
           ws.send(new TextEncoder().encode(data));
         }
+      };
+
+      if (textarea) {
+        textarea.addEventListener("compositionstart", () => {
+          isComposing = true;
+          lastComposed = "";
+        });
+        textarea.addEventListener("compositionupdate", (ev) => {
+          lastComposed = (ev as CompositionEvent).data ?? "";
+        });
+        textarea.addEventListener("compositionend", (ev) => {
+          isComposing = false;
+          // ev.data is unreliable on some Chromium builds — fall back to
+          // the last compositionupdate text we observed.
+          const text = (ev as CompositionEvent).data || lastComposed;
+          lastComposed = "";
+          if (text) {
+            sendRaw(text);
+            suppressNext = text;
+            suppressUntil = Date.now() + 200;
+          }
+        });
+      }
+
+      term.onData((data) => {
+        if (isComposing) return;
+        if (
+          suppressNext &&
+          data === suppressNext &&
+          Date.now() < suppressUntil
+        ) {
+          suppressNext = "";
+          return;
+        }
+        sendRaw(data);
       });
 
       term.onResize(({ cols, rows }) => {
@@ -283,10 +379,56 @@ export function Terminal({ name }: Props) {
       const ro = new ResizeObserver(() => doFit());
       ro.observe(host);
 
+      // Touch scrolling. On mobile the WebGL canvas (or the helper textarea
+      // overlay) absorbs touchmove, so xterm's viewport never gets the native
+      // scroll. We translate single-finger drags into term.scrollLines() and
+      // ignore multi-finger gestures so pinch-zoom still works.
+      let lastTouchY: number | null = null;
+      let scrollRemainder = 0;
+      const lineHeight = () => {
+        const rows = termRef.current?.rows ?? term.rows;
+        return rows > 0 ? host.clientHeight / rows : 18;
+      };
+      const onTouchStart = (e: TouchEvent) => {
+        if (e.touches.length !== 1) {
+          lastTouchY = null;
+          return;
+        }
+        lastTouchY = e.touches[0].clientY;
+        scrollRemainder = 0;
+      };
+      const onTouchMove = (e: TouchEvent) => {
+        if (lastTouchY === null || e.touches.length !== 1) return;
+        const y = e.touches[0].clientY;
+        const dy = lastTouchY - y + scrollRemainder;
+        const lh = lineHeight() || 18;
+        const lines = Math.trunc(dy / lh);
+        if (lines !== 0) {
+          termRef.current?.scrollLines(lines);
+          scrollRemainder = dy - lines * lh;
+        } else {
+          scrollRemainder = dy;
+        }
+        lastTouchY = y;
+        e.preventDefault();
+      };
+      const onTouchEnd = () => {
+        lastTouchY = null;
+        scrollRemainder = 0;
+      };
+      host.addEventListener("touchstart", onTouchStart, { passive: true });
+      host.addEventListener("touchmove", onTouchMove, { passive: false });
+      host.addEventListener("touchend", onTouchEnd, { passive: true });
+      host.addEventListener("touchcancel", onTouchEnd, { passive: true });
+
       await connect();
 
       return () => {
         ro.disconnect();
+        host.removeEventListener("touchstart", onTouchStart);
+        host.removeEventListener("touchmove", onTouchMove);
+        host.removeEventListener("touchend", onTouchEnd);
+        host.removeEventListener("touchcancel", onTouchEnd);
       };
     })();
 
@@ -323,6 +465,99 @@ export function Terminal({ name }: Props) {
     void connect();
   };
 
+  const extractLastAssistantText = useCallback((): string => {
+    const term = termRef.current;
+    if (!term) return "";
+    const buf = term.buffer.active;
+    const raw: string[] = [];
+    for (let i = 0; i < buf.length; i++) {
+      const line = buf.getLine(i);
+      raw.push(line ? line.translateToString(true) : "");
+    }
+
+    const BOX_CHARS_G = /[│┃╭╮╰╯─━└┘┌┐╔╗╚╝║═┏┓┗┛┃]/g;
+    const BOX_TOP_CHARS = /[╭┌╔┏]/;
+    const isBoxOrEmpty = (s: string) => {
+      const t = s.trim();
+      if (t === "") return true;
+      const stripped = t.replace(BOX_CHARS_G, "").trim();
+      return stripped === "" || /^[╭╮╰╯┌┐└┘┏┓┗┛]/.test(t);
+    };
+
+    // Claude Code TUI renders the input box (╭─╮ │>│ ╰─╯) plus a status
+    // footer ("? for shortcuts", model name, …) at the very bottom of the
+    // pane. Without skipping past the box's top edge, the trailing
+    // "trim box-or-empty" pass stops at the footer (plain text, not a box
+    // line) and we'd end up speaking the footer instead of the assistant's
+    // last reply. So: find the top edge of the most recent input box and
+    // treat everything from there downward as chrome.
+    let boxTop = -1;
+    for (let i = raw.length - 1; i >= 0; i--) {
+      if (BOX_TOP_CHARS.test(raw[i])) {
+        boxTop = i;
+        break;
+      }
+    }
+
+    let end = boxTop >= 0 ? boxTop : raw.length;
+    while (end > 0 && isBoxOrEmpty(raw[end - 1])) end--;
+
+    let start = end;
+    for (let i = end - 1; i >= 0; i--) {
+      if (isBoxOrEmpty(raw[i])) {
+        start = i + 1;
+        break;
+      }
+      const t = raw[i].replace(BOX_CHARS_G, "").trim();
+      if (/^>\s/.test(t)) {
+        start = i + 1;
+        break;
+      }
+      start = i;
+    }
+
+    const cleaned = raw
+      .slice(start, end)
+      .map((l) => l.replace(BOX_CHARS_G, "").replace(/^\s+|\s+$/g, ""))
+      .filter((l) => l !== "")
+      .join(" ");
+
+    return cleaned.slice(0, 1200);
+  }, []);
+
+  const toggleBriefing = useCallback(() => {
+    if (typeof window === "undefined" || !("speechSynthesis" in window)) {
+      setBanner("이 브라우저는 음성 합성을 지원하지 않습니다.");
+      return;
+    }
+    const synth = window.speechSynthesis;
+    if (synth.speaking || synth.pending) {
+      synth.cancel();
+      setSpeaking(false);
+      return;
+    }
+    const text = extractLastAssistantText();
+    if (!text) {
+      setBanner("읽을 답변을 찾지 못했습니다.");
+      return;
+    }
+    const utter = new SpeechSynthesisUtterance(text);
+    utter.lang = "ko-KR";
+    utter.rate = 1.05;
+    utter.onend = () => setSpeaking(false);
+    utter.onerror = () => setSpeaking(false);
+    setSpeaking(true);
+    synth.speak(utter);
+  }, [extractLastAssistantText]);
+
+  useEffect(() => {
+    return () => {
+      if (typeof window !== "undefined" && "speechSynthesis" in window) {
+        window.speechSynthesis.cancel();
+      }
+    };
+  }, []);
+
   const dotClass =
     status === "open"
       ? "dot connected"
@@ -339,6 +574,13 @@ export function Terminal({ name }: Props) {
           {size.cols}×{size.rows}
         </span>
         <span className="spacer" />
+        <button
+          onClick={toggleBriefing}
+          title={speaking ? "음성 정지" : "마지막 답변 음성 브리핑"}
+          aria-pressed={speaking}
+        >
+          {speaking ? "⏹ 정지" : "🔊 브리핑"}
+        </button>
         <button onClick={reconnect} title="WebSocket 재연결">
           🔌 재연결
         </button>

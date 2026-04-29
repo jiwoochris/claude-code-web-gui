@@ -46,7 +46,8 @@ export async function listSessions(): Promise<TmuxSession[]> {
 }
 
 export async function newSession(name: string): Promise<void> {
-  await run("tmux", ["new-session", "-d", "-s", name], { timeout: 3000 });
+  const cwd = process.env.WORKSPACE_ROOT ?? process.env.HOME ?? "/";
+  await run("tmux", ["new-session", "-d", "-s", name, "-c", cwd], { timeout: 3000 });
 }
 
 export async function killSession(name: string): Promise<void> {

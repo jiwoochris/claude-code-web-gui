@@ -85,6 +85,10 @@ export async function sendLine(name: string, text: string): Promise<void> {
   await run("tmux", ["send-keys", "-t", name, "Enter"], { timeout: 3000 });
 }
 
+export async function sendKey(name: string, key: string): Promise<void> {
+  await run("tmux", ["send-keys", "-t", name, key], { timeout: 3000 });
+}
+
 const SHELL_COMMANDS = new Set([
   "bash",
   "zsh",

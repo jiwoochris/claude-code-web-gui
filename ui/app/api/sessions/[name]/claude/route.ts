@@ -4,6 +4,7 @@ import {
   hasSession,
   isShellCommand,
   isValidSessionName,
+  sendKey,
   sendLine,
 } from "@/lib/tmux";
 import { log } from "@/lib/logger";
@@ -31,6 +32,13 @@ export async function POST(
     if (action === "start") {
       await sendLine(name, "claude");
     } else {
+      // Discard whatever the user has half-typed in the Claude TUI input box
+      // before injecting "/clear". Esc cancels in-progress streaming and
+      // clears the prompt buffer; without it we'd just append to the user's
+      // pending text. Two presses cover the "Esc-to-cancel-stream, Esc again
+      // to clear input" path.
+      await sendKey(name, "Escape");
+      await sendKey(name, "Escape");
       await sendLine(name, "/clear");
     }
     log.info("sessions.claude", { name, command: cmd, action });

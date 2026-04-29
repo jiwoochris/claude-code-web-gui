@@ -698,7 +698,6 @@ input {
   position: absolute;
   inset: 0;
   padding: 6px 0 0 8px;
-  touch-action: pan-y;
 }
 
 /* xterm theme adjustments */
@@ -1081,27 +1080,9 @@ input {
 
 /* ---------- Responsive ---------- */
 
-.mobile-bar {
-  display: none;
-  height: 44px;
-  padding: 0 12px;
-  align-items: center;
-  gap: 10px;
-  border-bottom: 1px solid var(--border);
-  background: var(--bg-elev);
-}
-
 @media (max-width: 1023px) {
-  .app-shell {
-    flex-direction: column;
-  }
-
   .lnb {
     position: fixed;
-    left: 0;
-    top: 0;
-    bottom: 0;
-    height: 100vh;
     z-index: 30;
     transform: translateX(-100%);
     transition: transform 160ms ease;
@@ -1114,19 +1095,21 @@ input {
 
   .main {
     padding-left: 0;
-    min-height: 0;
-    flex: 1 1 auto;
-  }
-
-  .term-page {
-    min-height: 0;
-    height: calc(100vh - 44px);
   }
 
   .mobile-bar {
     display: flex;
-    flex: 0 0 44px;
   }
+}
+
+.mobile-bar {
+  display: none;
+  height: 44px;
+  padding: 0 12px;
+  align-items: center;
+  gap: 10px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-elev);
 }
 
 .mobile-bar button {

@@ -320,66 +320,11 @@ export function Terminal({ name }: Props) {
         return true;
       });
 
-      // IME composition handling. xterm.js's onData leaks intermediate
-      // composition state for some IMEs (Korean), so we own the
-      // composition-text send: on compositionend we ship the committed
-      // text ourselves (synchronously, while still on the same task as
-      // the keystroke) and drop xterm's later duplicate via a short-lived
-      // exact-match suppress.
-      //
-      // Why not just gate onData on `isComposing`: between two chained
-      // compositions (e.g. ㄴ ending "안" and starting "녕") the prior
-      // composition's deferred xterm send fires AFTER the new
-      // compositionstart re-arms the gate, so the gate would swallow
-      // every word's leading syllables — only the last syllable before a
-      // SPACE / word break would survive.
-      const textarea = (term as unknown as { textarea?: HTMLTextAreaElement })
-        .textarea;
-      let isComposing = false;
-      let lastComposed = "";
-      let suppressNext = "";
-      let suppressUntil = 0;
-
-      const sendRaw = (data: string) => {
+      term.onData((data) => {
         const ws = wsRef.current;
         if (ws && ws.readyState === WebSocket.OPEN) {
           ws.send(new TextEncoder().encode(data));
         }
-      };
-
-      if (textarea) {
-        textarea.addEventListener("compositionstart", () => {
-          isComposing = true;
-          lastComposed = "";
-        });
-        textarea.addEventListener("compositionupdate", (ev) => {
-          lastComposed = (ev as CompositionEvent).data ?? "";
-        });
-        textarea.addEventListener("compositionend", (ev) => {
-          isComposing = false;
-          // ev.data is unreliable on some Chromium builds — fall back to
-          // the last compositionupdate text we observed.
-          const text = (ev as CompositionEvent).data || lastComposed;
-          lastComposed = "";
-          if (text) {
-            sendRaw(text);
-            suppressNext = text;
-            suppressUntil = Date.now() + 200;
-          }
-        });
-      }
-
-      term.onData((data) => {
-        if (isComposing) return;
-        if (
-          suppressNext &&
-          data === suppressNext &&
-          Date.now() < suppressUntil
-        ) {
-          suppressNext = "";
-          return;
-        }
-        sendRaw(data);
       });
 
       term.onResize(({ cols, rows }) => {
@@ -394,56 +339,10 @@ export function Terminal({ name }: Props) {
       const ro = new ResizeObserver(() => doFit());
       ro.observe(host);
 
-      // Touch scrolling. On mobile the WebGL canvas (or the helper textarea
-      // overlay) absorbs touchmove, so xterm's viewport never gets the native
-      // scroll. We translate single-finger drags into term.scrollLines() and
-      // ignore multi-finger gestures so pinch-zoom still works.
-      let lastTouchY: number | null = null;
-      let scrollRemainder = 0;
-      const lineHeight = () => {
-        const rows = termRef.current?.rows ?? term.rows;
-        return rows > 0 ? host.clientHeight / rows : 18;
-      };
-      const onTouchStart = (e: TouchEvent) => {
-        if (e.touches.length !== 1) {
-          lastTouchY = null;
-          return;
-        }
-        lastTouchY = e.touches[0].clientY;
-        scrollRemainder = 0;
-      };
-      const onTouchMove = (e: TouchEvent) => {
-        if (lastTouchY === null || e.touches.length !== 1) return;
-        const y = e.touches[0].clientY;
-        const dy = lastTouchY - y + scrollRemainder;
-        const lh = lineHeight() || 18;
-        const lines = Math.trunc(dy / lh);
-        if (lines !== 0) {
-          termRef.current?.scrollLines(lines);
-          scrollRemainder = dy - lines * lh;
-        } else {
-          scrollRemainder = dy;
-        }
-        lastTouchY = y;
-        e.preventDefault();
-      };
-      const onTouchEnd = () => {
-        lastTouchY = null;
-        scrollRemainder = 0;
-      };
-      host.addEventListener("touchstart", onTouchStart, { passive: true });
-      host.addEventListener("touchmove", onTouchMove, { passive: false });
-      host.addEventListener("touchend", onTouchEnd, { passive: true });
-      host.addEventListener("touchcancel", onTouchEnd, { passive: true });
-
       await connect();
 
       return () => {
         ro.disconnect();
-        host.removeEventListener("touchstart", onTouchStart);
-        host.removeEventListener("touchmove", onTouchMove);
-        host.removeEventListener("touchend", onTouchEnd);
-        host.removeEventListener("touchcancel", onTouchEnd);
       };
     })();
 

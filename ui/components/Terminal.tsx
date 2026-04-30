@@ -204,6 +204,7 @@ export function Terminal({ name }: Props) {
 
       const { Terminal: XTerm } = await import("@xterm/xterm");
       const { FitAddon } = await import("@xterm/addon-fit");
+      const { WebLinksAddon } = await import("@xterm/addon-web-links");
       // xterm.css is injected globally via the import below.
       await import("@xterm/xterm/css/xterm.css");
 
@@ -228,6 +229,14 @@ export function Terminal({ name }: Props) {
       });
       const fit = new FitAddon();
       term.loadAddon(fit);
+      term.loadAddon(
+        new WebLinksAddon((event, uri) => {
+          // Don't hijack selection drags — only act on a real click.
+          if (event.type !== "click" && event.type !== "auxclick") return;
+          if (event.button !== 0 && event.button !== 1) return;
+          window.open(uri, "_blank", "noopener,noreferrer");
+        }),
+      );
       term.open(host);
 
       try {

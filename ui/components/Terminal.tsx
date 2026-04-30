@@ -542,6 +542,14 @@ export function Terminal({ name }: Props) {
     };
   }, []);
 
+  const sendKey = useCallback((data: string) => {
+    const ws = wsRef.current;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(new TextEncoder().encode(data));
+    }
+    termRef.current?.focus();
+  }, []);
+
   const dotClass =
     status === "open"
       ? "dot connected"
@@ -589,6 +597,17 @@ export function Terminal({ name }: Props) {
 
       <div className="term-body">
         <div ref={hostRef} className="xterm-host" />
+      </div>
+
+      <div className="term-keys" role="toolbar" aria-label="키보드 보조키">
+        <button onMouseDown={(e) => e.preventDefault()} onClick={() => sendKey("\x1b")} aria-label="Esc">Esc</button>
+        <button onMouseDown={(e) => e.preventDefault()} onClick={() => sendKey("\t")} aria-label="Tab">Tab</button>
+        <button onMouseDown={(e) => e.preventDefault()} onClick={() => sendKey("\x03")} aria-label="Ctrl+C">^C</button>
+        <span className="term-keys-spacer" />
+        <button onMouseDown={(e) => e.preventDefault()} onClick={() => sendKey("\x1b[D")} aria-label="왼쪽">←</button>
+        <button onMouseDown={(e) => e.preventDefault()} onClick={() => sendKey("\x1b[B")} aria-label="아래">↓</button>
+        <button onMouseDown={(e) => e.preventDefault()} onClick={() => sendKey("\x1b[A")} aria-label="위">↑</button>
+        <button onMouseDown={(e) => e.preventDefault()} onClick={() => sendKey("\x1b[C")} aria-label="오른쪽">→</button>
       </div>
     </div>
   );

@@ -559,6 +559,27 @@ export function Terminal({ name }: Props) {
     termRef.current?.focus();
   }, []);
 
+  // Synthesizes a mouse-wheel scroll for mobile (no physical wheel). xterm's
+  // own viewport handles plain scrollback; TUIs that enable mouse tracking
+  // (Claude Code does) instead consume an SGR wheel report, so emit both.
+  const sendWheel = useCallback((dir: "up" | "down") => {
+    const term = termRef.current;
+    if (!term) return;
+    try {
+      term.scrollLines(dir === "up" ? -3 : 3);
+    } catch {
+      /* ignore */
+    }
+    const ws = wsRef.current;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      const x = Math.max(1, Math.floor(term.cols / 2));
+      const y = Math.max(1, Math.floor(term.rows / 2));
+      const code = dir === "up" ? 64 : 65;
+      ws.send(new TextEncoder().encode(`\x1b[<${code};${x};${y}M`));
+    }
+    term.focus();
+  }, []);
+
   const dotClass =
     status === "open"
       ? "dot connected"
@@ -613,6 +634,8 @@ export function Terminal({ name }: Props) {
         <button onMouseDown={(e) => e.preventDefault()} onClick={() => sendKey("\t")} aria-label="Tab">Tab</button>
         <button onMouseDown={(e) => e.preventDefault()} onClick={() => sendKey("\x03")} aria-label="Ctrl+C">^C</button>
         <span className="term-keys-spacer" />
+        <button onMouseDown={(e) => e.preventDefault()} onClick={() => sendWheel("up")} aria-label="휠 위로">⇞</button>
+        <button onMouseDown={(e) => e.preventDefault()} onClick={() => sendWheel("down")} aria-label="휠 아래로">⇟</button>
         <button onMouseDown={(e) => e.preventDefault()} onClick={() => sendKey("\x1b[D")} aria-label="왼쪽">←</button>
         <button onMouseDown={(e) => e.preventDefault()} onClick={() => sendKey("\x1b[B")} aria-label="아래">↓</button>
         <button onMouseDown={(e) => e.preventDefault()} onClick={() => sendKey("\x1b[A")} aria-label="위">↑</button>

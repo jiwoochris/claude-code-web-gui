@@ -168,7 +168,7 @@ export function FileViewer({ state, onDownload }: Props) {
             path={state.path}
             language={languageFromPath(state.path)}
             value={state.content}
-            theme="vs-dark"
+            theme="vs"
             options={{
               readOnly: true,
               domReadOnly: true,

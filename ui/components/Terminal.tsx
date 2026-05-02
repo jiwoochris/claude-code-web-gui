@@ -274,8 +274,32 @@ export function Terminal({ name }: Props) {
       // web GUI's old `\n` payload didn't work. Ctrl+C copies the current
       // selection when there is one (otherwise it falls through as SIGINT).
       // Ctrl+V pastes from the browser clipboard.
+      const isCoarsePointer =
+        typeof window !== "undefined" &&
+        window.matchMedia?.("(pointer: coarse)").matches;
+
       term.attachCustomKeyEventHandler((ev) => {
         if (ev.type !== "keydown") return true;
+
+        // IME composition (Korean, Japanese, Chinese, etc.) — let xterm's
+        // textarea handle it via composition events. Returning true here
+        // would have xterm try to interpret a 229/Unidentified keydown as
+        // a literal key, which corrupts or drops the composed character.
+        if (
+          ev.isComposing ||
+          ev.keyCode === 229 ||
+          ev.key === "Process" ||
+          ev.key === "Unidentified"
+        ) {
+          return true;
+        }
+
+        // Mobile/touch: skip the desktop chord shortcuts entirely. They
+        // only matter for hardware-keyboard chords (Shift+Enter, Ctrl+C,
+        // Ctrl+V, Ctrl+Backspace), and intercepting keydown on Android
+        // Gboard / iOS keyboards has been observed to drop or duplicate
+        // characters around space and Enter when an IME is composing.
+        if (isCoarsePointer) return true;
 
         if (
           ev.key === "Enter" &&

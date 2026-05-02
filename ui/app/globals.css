@@ -14,9 +14,8 @@
   --danger: #c62a36;
   --ok: #137e3d;
 
-  /* Terminal body keeps its dark canvas — only the app chrome is light. */
-  --term-bg: #0c0f14;
-  --term-fg: #e6e8eb;
+  --term-bg: #ffffff;
+  --term-fg: #1b1f27;
 
   --lnb-w: 260px;
   --header-h: 44px;

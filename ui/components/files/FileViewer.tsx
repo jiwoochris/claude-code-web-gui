@@ -176,7 +176,8 @@ export function FileViewer({ state, onDownload }: Props) {
               fontSize: 13,
               scrollBeyondLastLine: false,
               renderWhitespace: "selection",
-              wordWrap: "off",
+              wordWrap: "on",
+              wrappingStrategy: "advanced",
               automaticLayout: true,
             }}
           />

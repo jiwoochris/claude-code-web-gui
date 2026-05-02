@@ -20,11 +20,16 @@ const STORAGE_KEY = "lnb:v1";
 type Persisted = {
   open: Record<SectionId, boolean>;
   ratio: number; // 0..1, share of sessions section when both open
+  width: number; // px, LNB width on desktop
 };
+
+const LNB_MIN_W = 200;
+const LNB_MAX_W = 560;
 
 const DEFAULT_STATE: Persisted = {
   open: { sessions: true, files: true },
   ratio: 0.45,
+  width: 280,
 };
 
 function loadState(): Persisted {
@@ -33,6 +38,10 @@ function loadState(): Persisted {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (!raw) return DEFAULT_STATE;
     const parsed = JSON.parse(raw) as Partial<Persisted>;
+    const width =
+      typeof parsed.width === "number" && parsed.width >= LNB_MIN_W && parsed.width <= LNB_MAX_W
+        ? parsed.width
+        : DEFAULT_STATE.width;
     return {
       open: {
         sessions: parsed.open?.sessions ?? true,
@@ -42,6 +51,7 @@ function loadState(): Persisted {
         typeof parsed.ratio === "number" && parsed.ratio > 0.1 && parsed.ratio < 0.9
           ? parsed.ratio
           : DEFAULT_STATE.ratio,
+      width,
     };
   } catch {
     return DEFAULT_STATE;
@@ -109,6 +119,28 @@ export function Lnb() {
     [],
   );
 
+  const startWidthResize = useCallback(
+    (e: ReactPointerEvent<HTMLDivElement>) => {
+      e.preventDefault();
+      (e.currentTarget as HTMLDivElement).setPointerCapture(e.pointerId);
+      document.body.classList.add("col-resizing");
+      const onMove = (ev: PointerEvent) => {
+        let w = ev.clientX;
+        if (w < LNB_MIN_W) w = LNB_MIN_W;
+        if (w > LNB_MAX_W) w = LNB_MAX_W;
+        setState((prev) => ({ ...prev, width: w }));
+      };
+      const onUp = () => {
+        document.body.classList.remove("col-resizing");
+        window.removeEventListener("pointermove", onMove);
+        window.removeEventListener("pointerup", onUp);
+      };
+      window.addEventListener("pointermove", onMove);
+      window.addEventListener("pointerup", onUp);
+    },
+    [],
+  );
+
   const logout = async () => {
     await fetch("/api/auth/logout", {
       method: "POST",
@@ -134,7 +166,11 @@ export function Lnb() {
         onClick={() => setLnbOpen(false)}
       />
 
-      <aside className={`lnb${lnbOpen ? " open" : ""}`} aria-label="사이드바">
+      <aside
+        className={`lnb${lnbOpen ? " open" : ""}`}
+        aria-label="사이드바"
+        style={hydrated ? { width: state.width, flexBasis: state.width } : undefined}
+      >
         <Link href="/" className="lnb-brand">
           <div className="title">Claude Code</div>
           <div className="subtitle">Web GUI</div>
@@ -207,6 +243,14 @@ export function Lnb() {
         <div className="lnb-footer">
           <button onClick={logout}>로그아웃</button>
         </div>
+
+        <div
+          className="lnb-width-handle"
+          onPointerDown={startWidthResize}
+          role="separator"
+          aria-orientation="vertical"
+          aria-label="사이드바 폭 조절"
+        />
       </aside>
     </>
   );

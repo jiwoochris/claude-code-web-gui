@@ -567,34 +567,51 @@ export function Terminal({ name }: Props) {
     };
   }, []);
 
-  const sendKey = useCallback((data: string) => {
-    const ws = wsRef.current;
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(new TextEncoder().encode(data));
-    }
+  const focusIfKeyboardLikelyVisible = useCallback(() => {
+    // On mobile, calling term.focus() steals focus to xterm's hidden
+    // <textarea>, which yanks the on-screen keyboard up even when the user
+    // just wanted to tap a soft key. Only refocus when there's already a
+    // physical (or soft) keyboard in play — i.e. an existing focused input.
+    if (typeof window === "undefined") return;
+    const isCoarse = window.matchMedia?.("(pointer: coarse)").matches ?? false;
+    if (isCoarse) return;
     termRef.current?.focus();
   }, []);
+
+  const sendKey = useCallback(
+    (data: string) => {
+      const ws = wsRef.current;
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(new TextEncoder().encode(data));
+      }
+      focusIfKeyboardLikelyVisible();
+    },
+    [focusIfKeyboardLikelyVisible],
+  );
 
   // Synthesizes a mouse-wheel scroll for mobile (no physical wheel). xterm's
   // own viewport handles plain scrollback; TUIs that enable mouse tracking
   // (Claude Code does) instead consume an SGR wheel report, so emit both.
-  const sendWheel = useCallback((dir: "up" | "down") => {
-    const term = termRef.current;
-    if (!term) return;
-    try {
-      term.scrollLines(dir === "up" ? -3 : 3);
-    } catch {
-      /* ignore */
-    }
-    const ws = wsRef.current;
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      const x = Math.max(1, Math.floor(term.cols / 2));
-      const y = Math.max(1, Math.floor(term.rows / 2));
-      const code = dir === "up" ? 64 : 65;
-      ws.send(new TextEncoder().encode(`\x1b[<${code};${x};${y}M`));
-    }
-    term.focus();
-  }, []);
+  const sendWheel = useCallback(
+    (dir: "up" | "down") => {
+      const term = termRef.current;
+      if (!term) return;
+      try {
+        term.scrollLines(dir === "up" ? -3 : 3);
+      } catch {
+        /* ignore */
+      }
+      const ws = wsRef.current;
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        const x = Math.max(1, Math.floor(term.cols / 2));
+        const y = Math.max(1, Math.floor(term.rows / 2));
+        const code = dir === "up" ? 64 : 65;
+        ws.send(new TextEncoder().encode(`\x1b[<${code};${x};${y}M`));
+      }
+      focusIfKeyboardLikelyVisible();
+    },
+    [focusIfKeyboardLikelyVisible],
+  );
 
   const dotClass =
     status === "open"

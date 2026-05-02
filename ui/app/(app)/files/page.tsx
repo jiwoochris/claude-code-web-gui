@@ -17,6 +17,7 @@ export default function FilesPage() {
   const [connId, setConnId] = useState<string | null>(null);
   const [watchOk, setWatchOk] = useState(false);
   const [topError, setTopError] = useState<string | null>(null);
+  const [treeVisible, setTreeVisible] = useState(true);
 
   const connIdRef = useRef<string | null>(null);
   const selectedRef = useRef<string | null>(null);
@@ -142,6 +143,9 @@ export default function FilesPage() {
       if (prev && prev !== relPath) subscribeWatch(prev, "file", "remove");
       await openFile(relPath);
       subscribeWatch(relPath, "file", "add");
+      if (typeof window !== "undefined" && window.matchMedia("(max-width: 1023px)").matches) {
+        setTreeVisible(false);
+      }
     },
     [openFile, subscribeWatch],
   );
@@ -274,6 +278,14 @@ export default function FilesPage() {
   return (
     <div className="files-page">
       <div className="fv-header">
+        <button
+          className="btn tree-toggle"
+          onClick={() => setTreeVisible((v) => !v)}
+          title={treeVisible ? "트리 숨기기" : "트리 보이기"}
+          aria-pressed={treeVisible}
+        >
+          {treeVisible ? "◧" : "▦"}
+        </button>
         <Breadcrumb rootName={rootName} path={currentPath} onNavigate={handleBreadcrumbNavigate} />
         <span className="spacer" />
         <span className={`watch-status${watchOk ? " ok" : ""}`} title={watchOk ? "실시간 감시 중" : "감시 연결 안됨"}>
@@ -286,7 +298,7 @@ export default function FilesPage() {
 
       {topError ? <div className="fv-banner err">{topError}</div> : null}
 
-      <div className="fv-split">
+      <div className={`fv-split${treeVisible ? "" : " tree-hidden"}`}>
         <aside className="fv-pane-left">
           <FileTree
             trees={trees}

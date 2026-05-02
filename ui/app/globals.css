@@ -916,6 +916,16 @@ input {
   padding: 8px 4px 20px;
 }
 
+.fv-split.tree-hidden .fv-pane-left {
+  display: none;
+}
+
+.fv-header .tree-toggle {
+  padding: 4px 8px;
+  font-size: 14px;
+  line-height: 1;
+}
+
 .fv-pane-right {
   flex: 1;
   min-width: 0;
@@ -1162,6 +1172,16 @@ input {
   .term-page {
     min-height: 0;
     height: calc(100vh - 44px);
+  }
+
+  .fv-pane-left {
+    width: 100%;
+    flex: 1 1 auto;
+    border-right: none;
+  }
+
+  .fv-split:not(.tree-hidden) .fv-pane-right {
+    display: none;
   }
 }
 

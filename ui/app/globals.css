@@ -373,6 +373,91 @@ input {
   padding: 2px 4px 4px;
 }
 
+.lnb-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.lnb-section {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.lnb-section:last-child {
+  border-bottom: none;
+}
+
+.lnb-section-header {
+  height: 30px;
+  flex: 0 0 30px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 12px;
+  background: var(--bg-elev);
+  color: var(--fg-muted);
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  border: none;
+  border-bottom: 1px solid var(--border);
+  cursor: pointer;
+  text-align: left;
+}
+
+.lnb-section-header:hover {
+  color: var(--fg);
+  background: var(--bg-elev-2);
+}
+
+.lnb-section-header .caret {
+  display: inline-block;
+  width: 10px;
+  font-size: 10px;
+  color: var(--fg-dim);
+}
+
+.lnb-section.open .lnb-section-header {
+  color: var(--fg);
+}
+
+.lnb-section-body {
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+.lnb-resizer {
+  flex: 0 0 6px;
+  height: 6px;
+  cursor: row-resize;
+  background: transparent;
+  position: relative;
+}
+
+.lnb-resizer::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 2px;
+  height: 2px;
+  background: var(--border);
+  transition: background 120ms ease;
+}
+
+.lnb-resizer:hover::after,
+.lnb-resizer:active::after {
+  background: var(--accent);
+}
+
 .lnb-sessions {
   flex: 1;
   overflow-y: auto;
@@ -603,7 +688,7 @@ input {
   flex: 1;
   display: flex;
   flex-direction: column;
-  min-height: 100vh;
+  min-height: 0;
   background: var(--term-bg);
 }
 
@@ -1129,6 +1214,238 @@ input {
   font-size: 12px;
 }
 
+/* ---------- LNB files section ---------- */
+
+.lnb-files {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.lnb-files-toolbar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border);
+  font-size: 11px;
+  color: var(--fg-muted);
+}
+
+.lnb-files-toolbar .root {
+  font-weight: 500;
+  color: var(--fg);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.lnb-files-toolbar .spacer {
+  flex: 1;
+}
+
+.lnb-files-toolbar .watch-status {
+  font-size: 10px;
+  color: var(--fg-dim);
+  letter-spacing: 0.04em;
+}
+
+.lnb-files-toolbar .watch-status.ok {
+  color: var(--ok);
+}
+
+.lnb-files-toolbar .lnb-icon-btn {
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--fg-muted);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.lnb-files-toolbar .lnb-icon-btn:hover {
+  color: var(--fg);
+  border-color: var(--fg-muted);
+}
+
+.lnb-files-err {
+  flex: 0 0 auto;
+  padding: 6px 10px;
+  font-size: 11px;
+  color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 10%, transparent);
+}
+
+.lnb-files-tree {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 4px 4px 12px;
+}
+
+/* ---------- Session shell (file viewer + terminal) ---------- */
+
+.session-shell {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  height: 100vh;
+  background: var(--bg);
+}
+
+.session-split {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.session-pane {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.session-pane.term-only,
+.session-pane.term-pane {
+  flex: 1;
+  min-height: 0;
+}
+
+.session-pane.file-pane {
+  background: var(--bg);
+  border-bottom: 1px solid var(--border);
+}
+
+.session-file-bar {
+  flex: 0 0 32px;
+  height: 32px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 10px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-elev);
+  font-size: 12px;
+}
+
+.session-file-bar .path {
+  color: var(--fg-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+}
+
+.session-file-bar .spacer {
+  flex: 1;
+}
+
+.session-file-bar .close {
+  padding: 2px 8px;
+  border-radius: 4px;
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--fg-muted);
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.session-file-bar .close:hover {
+  color: var(--danger);
+  border-color: var(--danger);
+}
+
+.session-file-host {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.session-resizer {
+  flex: 0 0 6px;
+  height: 6px;
+  cursor: row-resize;
+  background: transparent;
+  position: relative;
+}
+
+.session-resizer::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 2px;
+  height: 2px;
+  background: var(--border);
+  transition: background 120ms ease;
+}
+
+.session-resizer:hover::after,
+.session-resizer:active::after {
+  background: var(--accent);
+}
+
+.session-tabs {
+  flex: 0 0 36px;
+  height: 36px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 8px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-elev);
+}
+
+.session-tabs button {
+  padding: 4px 12px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--fg-muted);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.session-tabs button.active {
+  color: var(--accent);
+  background: var(--accent-soft);
+  border-color: color-mix(in srgb, var(--accent) 35%, transparent);
+}
+
+.session-tabs .spacer {
+  flex: 1;
+}
+
+.session-tabs .close {
+  padding: 4px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--fg-muted);
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.session-tabs .close:hover {
+  color: var(--danger);
+  border-color: var(--danger);
+}
+
+.session-mobile-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
 /* ---------- Responsive ---------- */
 
 .mobile-bar {
@@ -1171,6 +1488,14 @@ input {
 
   .term-page {
     min-height: 0;
+    height: 100%;
+  }
+
+  .session-shell {
+    height: calc(100vh - 44px);
+  }
+
+  .files-page {
     height: calc(100vh - 44px);
   }
 

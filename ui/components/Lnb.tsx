@@ -1,213 +1,113 @@
 "use client";
 
-import { FormEvent, useCallback, useEffect, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type PointerEvent as ReactPointerEvent,
+} from "react";
 import Link from "next/link";
-import { useParams, usePathname, useRouter } from "next/navigation";
-import useSWR from "swr";
+import { usePathname } from "next/navigation";
+import { SessionsSection } from "./SessionsSection";
+import { FilesSection } from "./FilesSection";
 
-type Session = {
-  name: string;
-  created: number;
-  attached: boolean;
-  windows: number;
+type SectionId = "sessions" | "files";
+
+const STORAGE_KEY = "lnb:v1";
+
+type Persisted = {
+  open: Record<SectionId, boolean>;
+  ratio: number; // 0..1, share of sessions section when both open
 };
 
-type DirEntry = {
-  name: string;
-  type: "file" | "dir" | "symlink" | "other";
+const DEFAULT_STATE: Persisted = {
+  open: { sessions: true, files: true },
+  ratio: 0.45,
 };
 
-type TreeResponse = {
-  path: string;
-  rootName: string;
-  entries: DirEntry[];
-};
-
-const fetcher = async (url: string): Promise<Session[]> => {
-  const res = await fetch(url, { credentials: "include" });
-  if (res.status === 401) {
-    if (typeof window !== "undefined") window.location.href = "/login";
-    return [];
+function loadState(): Persisted {
+  if (typeof window === "undefined") return DEFAULT_STATE;
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) return DEFAULT_STATE;
+    const parsed = JSON.parse(raw) as Partial<Persisted>;
+    return {
+      open: {
+        sessions: parsed.open?.sessions ?? true,
+        files: parsed.open?.files ?? true,
+      },
+      ratio:
+        typeof parsed.ratio === "number" && parsed.ratio > 0.1 && parsed.ratio < 0.9
+          ? parsed.ratio
+          : DEFAULT_STATE.ratio,
+    };
+  } catch {
+    return DEFAULT_STATE;
   }
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  return res.json();
-};
+}
 
-const NAME_RE = /^[a-zA-Z0-9_-]{1,32}$/;
-
-function joinPath(parent: string, name: string): string {
-  return parent ? `${parent}/${name}` : name;
+function persist(state: Persisted) {
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+  } catch {
+    /* ignore */
+  }
 }
 
 export function Lnb() {
-  const router = useRouter();
   const pathname = usePathname();
-  const params = useParams<{ name?: string }>();
-  const currentName = params?.name ?? null;
-
-  const { data, error, isLoading, mutate } = useSWR<Session[]>(
-    "/api/sessions",
-    fetcher,
-    { refreshInterval: 10_000, revalidateOnFocus: true },
-  );
-
-  const sessions = data ?? [];
-
-  const [creating, setCreating] = useState(false);
-  const [newName, setNewName] = useState("");
-  const [createErr, setCreateErr] = useState<string | null>(null);
-  const [submitting, setSubmitting] = useState(false);
-  const inputRef = useRef<HTMLInputElement>(null);
   const [lnbOpen, setLnbOpen] = useState(false);
-
-  // Directory picker state — only loaded while the create form is open.
-  const [rootName, setRootName] = useState<string>("workspace");
-  const [dirChildren, setDirChildren] = useState<Map<string, DirEntry[]>>(
-    new Map(),
-  );
-  const [dirLoading, setDirLoading] = useState<Set<string>>(new Set());
-  const [dirExpanded, setDirExpanded] = useState<Set<string>>(new Set([""]));
-  const [selectedCwd, setSelectedCwd] = useState<string>("");
-  const [dirError, setDirError] = useState<string | null>(null);
-
-  const loadDir = useCallback(
-    async (relPath: string) => {
-      setDirLoading((prev) => {
-        if (prev.has(relPath)) return prev;
-        const next = new Set(prev);
-        next.add(relPath);
-        return next;
-      });
-      try {
-        const url = `/api/fs/tree?path=${encodeURIComponent(relPath)}`;
-        const res = await fetch(url, { credentials: "include" });
-        if (res.status === 401) {
-          window.location.href = "/login";
-          return;
-        }
-        if (!res.ok) {
-          setDirError("디렉토리를 불러오지 못했습니다.");
-          return;
-        }
-        const data = (await res.json()) as TreeResponse;
-        if (data.rootName) setRootName(data.rootName);
-        const dirs = data.entries.filter((e) => e.type === "dir");
-        setDirChildren((prev) => {
-          const next = new Map(prev);
-          next.set(relPath, dirs);
-          return next;
-        });
-      } catch {
-        setDirError("네트워크 오류");
-      } finally {
-        setDirLoading((prev) => {
-          const next = new Set(prev);
-          next.delete(relPath);
-          return next;
-        });
-      }
-    },
-    [],
-  );
+  const [state, setState] = useState<Persisted>(DEFAULT_STATE);
+  const [hydrated, setHydrated] = useState(false);
+  const bodyRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    if (creating) inputRef.current?.focus();
-  }, [creating]);
+    setState(loadState());
+    setHydrated(true);
+  }, []);
 
   useEffect(() => {
-    if (creating && !dirChildren.has("")) {
-      void loadDir("");
-    }
-  }, [creating, dirChildren, loadDir]);
+    if (hydrated) persist(state);
+  }, [state, hydrated]);
 
   useEffect(() => {
     setLnbOpen(false);
   }, [pathname]);
 
-  const startCreate = () => {
-    setCreateErr(null);
-    setNewName("");
-    setSelectedCwd("");
-    setDirExpanded(new Set([""]));
-    setDirError(null);
-    setCreating(true);
-  };
-
-  const cancelCreate = () => {
-    setCreating(false);
-    setNewName("");
-    setCreateErr(null);
-    setDirError(null);
-  };
-
-  const toggleDir = useCallback(
-    (relPath: string) => {
-      setDirExpanded((prev) => {
-        const next = new Set(prev);
-        if (next.has(relPath)) {
-          next.delete(relPath);
-        } else {
-          next.add(relPath);
-          if (!dirChildren.has(relPath)) void loadDir(relPath);
-        }
-        return next;
-      });
-    },
-    [dirChildren, loadDir],
-  );
-
-  const submitCreate = useCallback(
-    async (e?: FormEvent) => {
-      e?.preventDefault();
-      if (submitting) return;
-      const name = newName.trim();
-      if (!NAME_RE.test(name)) {
-        setCreateErr("영문/숫자/_/- 1~32자");
-        return;
-      }
-      setSubmitting(true);
-      setCreateErr(null);
-      try {
-        const res = await fetch("/api/sessions", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          credentials: "include",
-          body: JSON.stringify({ name, cwd: selectedCwd }),
-        });
-        if (res.status === 409) {
-          setCreateErr("이미 존재하는 이름입니다.");
-          return;
-        }
-        if (!res.ok) {
-          setCreateErr("생성에 실패했습니다.");
-          return;
-        }
-        await mutate();
-        setCreating(false);
-        setNewName("");
-        router.push(`/s/${encodeURIComponent(name)}`);
-      } catch {
-        setCreateErr("네트워크 오류");
-      } finally {
-        setSubmitting(false);
-      }
-    },
-    [newName, selectedCwd, mutate, router, submitting],
-  );
-
-  const killSession = async (name: string) => {
-    if (!confirm(`세션 '${name}' 을(를) 종료할까요?`)) return;
-    const res = await fetch(`/api/sessions/${encodeURIComponent(name)}`, {
-      method: "DELETE",
-      credentials: "include",
+  const toggleSection = useCallback((id: SectionId) => {
+    setState((prev) => {
+      const next = { ...prev.open, [id]: !prev.open[id] };
+      // Force at least one section open (otherwise the resizer/body looks empty).
+      if (!next.sessions && !next.files) next[id === "sessions" ? "files" : "sessions"] = true;
+      return { ...prev, open: next };
     });
-    if (!res.ok && res.status !== 404) {
-      alert("삭제에 실패했습니다.");
-      return;
-    }
-    await mutate();
-    if (currentName === name) router.push("/");
-  };
+  }, []);
+
+  const startResize = useCallback(
+    (e: ReactPointerEvent<HTMLDivElement>) => {
+      const body = bodyRef.current;
+      if (!body) return;
+      e.preventDefault();
+      (e.currentTarget as HTMLDivElement).setPointerCapture(e.pointerId);
+      const rect = body.getBoundingClientRect();
+      const onMove = (ev: PointerEvent) => {
+        const offset = ev.clientY - rect.top;
+        let ratio = offset / rect.height;
+        if (ratio < 0.15) ratio = 0.15;
+        if (ratio > 0.85) ratio = 0.85;
+        setState((prev) => ({ ...prev, ratio }));
+      };
+      const onUp = () => {
+        window.removeEventListener("pointermove", onMove);
+        window.removeEventListener("pointerup", onUp);
+      };
+      window.addEventListener("pointermove", onMove);
+      window.addEventListener("pointerup", onUp);
+    },
+    [],
+  );
 
   const logout = async () => {
     await fetch("/api/auth/logout", {
@@ -217,276 +117,97 @@ export function Lnb() {
     window.location.href = "/login";
   };
 
+  const bothOpen = state.open.sessions && state.open.files;
+  const ratioPct = useMemo(() => `${Math.round(state.ratio * 100)}%`, [state.ratio]);
+
   return (
     <>
       <div className="mobile-bar">
-        <button onClick={() => setLnbOpen((v) => !v)} aria-label="세션 목록 열기">
+        <button onClick={() => setLnbOpen((v) => !v)} aria-label="사이드바 열기">
           ☰
         </button>
         <div className="title">Claude Code Web GUI</div>
       </div>
 
-      <div className={`lnb-backdrop${lnbOpen ? " show" : ""}`} onClick={() => setLnbOpen(false)} />
+      <div
+        className={`lnb-backdrop${lnbOpen ? " show" : ""}`}
+        onClick={() => setLnbOpen(false)}
+      />
 
-      <aside className={`lnb${lnbOpen ? " open" : ""}`} aria-label="세션 내비게이션">
+      <aside className={`lnb${lnbOpen ? " open" : ""}`} aria-label="사이드바">
         <Link href="/" className="lnb-brand">
           <div className="title">Claude Code</div>
           <div className="subtitle">Web GUI</div>
         </Link>
 
-        <div className="lnb-create">
-          {!creating ? (
-            <button className="btn-new" onClick={startCreate}>
-              + 새 세션
+        <div className="lnb-body" ref={bodyRef}>
+          <section
+            className={`lnb-section${state.open.sessions ? " open" : ""}`}
+            style={
+              bothOpen
+                ? { flex: `0 0 ${ratioPct}` }
+                : state.open.sessions
+                  ? { flex: "1 1 auto" }
+                  : { flex: "0 0 auto" }
+            }
+          >
+            <button
+              type="button"
+              className="lnb-section-header"
+              onClick={() => toggleSection("sessions")}
+              aria-expanded={state.open.sessions}
+            >
+              <span className="caret">{state.open.sessions ? "▾" : "▸"}</span>
+              <span className="label">세션</span>
             </button>
-          ) : (
-            <form className="inline-form" onSubmit={submitCreate}>
-              <input
-                ref={inputRef}
-                value={newName}
-                placeholder="세션 이름"
-                onChange={(e) => {
-                  setNewName(e.target.value);
-                  if (createErr) setCreateErr(null);
-                }}
-                onKeyDown={(e) => {
-                  if (e.key === "Escape") cancelCreate();
-                }}
-                aria-invalid={createErr !== null}
-                maxLength={32}
-              />
-              <div className="dir-picker" role="tree" aria-label="작업 디렉토리 선택">
-                <div className="dir-picker-label">시작 디렉토리</div>
-                <DirNode
-                  rel=""
-                  label={rootName}
-                  selected={selectedCwd === ""}
-                  expanded={dirExpanded.has("")}
-                  loading={dirLoading.has("")}
-                  hasChildren={(dirChildren.get("") ?? []).length > 0}
-                  onToggle={() => toggleDir("")}
-                  onSelect={() => setSelectedCwd("")}
-                />
-                {dirExpanded.has("") && (
-                  <DirChildren
-                    parent=""
-                    entries={dirChildren.get("") ?? []}
-                    expanded={dirExpanded}
-                    loading={dirLoading}
-                    childMap={dirChildren}
-                    selected={selectedCwd}
-                    onToggle={toggleDir}
-                    onSelect={setSelectedCwd}
-                  />
-                )}
-                {dirError && <div className="hint err">{dirError}</div>}
+            {state.open.sessions ? (
+              <div className="lnb-section-body">
+                <SessionsSection />
               </div>
-              <div className="actions">
-                <button
-                  type="submit"
-                  className="primary"
-                  disabled={submitting}
-                  aria-busy={submitting}
-                >
-                  {submitting ? "…" : "생성"}
-                </button>
-                <button type="button" onClick={cancelCreate} disabled={submitting}>
-                  취소
-                </button>
+            ) : null}
+          </section>
+
+          {bothOpen ? (
+            <div
+              className="lnb-resizer"
+              onPointerDown={startResize}
+              role="separator"
+              aria-orientation="horizontal"
+              aria-label="섹션 크기 조절"
+            />
+          ) : null}
+
+          <section
+            className={`lnb-section${state.open.files ? " open" : ""}`}
+            style={
+              bothOpen
+                ? { flex: "1 1 auto" }
+                : state.open.files
+                  ? { flex: "1 1 auto" }
+                  : { flex: "0 0 auto" }
+            }
+          >
+            <button
+              type="button"
+              className="lnb-section-header"
+              onClick={() => toggleSection("files")}
+              aria-expanded={state.open.files}
+            >
+              <span className="caret">{state.open.files ? "▾" : "▸"}</span>
+              <span className="label">파일</span>
+            </button>
+            {state.open.files ? (
+              <div className="lnb-section-body">
+                <FilesSection />
               </div>
-              {createErr ? (
-                <div className="hint err">{createErr}</div>
-              ) : (
-                <div className="hint">Enter 생성 · Esc 취소</div>
-              )}
-            </form>
-          )}
-        </div>
-
-        <div className="lnb-sessions" aria-busy={isLoading}>
-          <div className="lnb-sessions-header">
-            <span>활성 세션</span>
-            <span className="count">{sessions.length}</span>
-          </div>
-
-          {error ? (
-            <div className="lnb-empty">세션 목록을 가져오지 못했습니다.</div>
-          ) : sessions.length === 0 ? (
-            <div className="lnb-empty">
-              세션이 없습니다.
-              <br />
-              <strong>+ 새 세션</strong>을 눌러
-              <br />
-              첫 세션을 만들어 보세요.
-            </div>
-          ) : (
-            sessions.map((s) => {
-              const active = s.name === currentName;
-              return (
-                <Link
-                  key={s.name}
-                  href={`/s/${encodeURIComponent(s.name)}`}
-                  className={`lnb-session${active ? " active" : ""}${s.attached ? " attached" : ""}`}
-                  aria-current={active ? "page" : undefined}
-                >
-                  <span
-                    className="dot"
-                    aria-label={s.attached ? "연결됨" : "분리됨"}
-                    title={s.attached ? "attached" : "detached"}
-                  />
-                  <span className="meta">
-                    <span className="name">{s.name}</span>
-                    <span className="sub">
-                      창 {s.windows}개{s.attached ? " · 사용 중" : ""}
-                    </span>
-                  </span>
-                  <button
-                    className="kill"
-                    aria-label={`${s.name} 세션 삭제`}
-                    onClick={(e) => {
-                      e.preventDefault();
-                      e.stopPropagation();
-                      killSession(s.name);
-                    }}
-                  >
-                    ✕
-                  </button>
-                </Link>
-              );
-            })
-          )}
+            ) : null}
+          </section>
         </div>
 
         <div className="lnb-footer">
-          <Link
-            href="/files"
-            className={`lnb-link${pathname?.startsWith("/files") ? " active" : ""}`}
-          >
-            📁 파일 탐색기
-          </Link>
-          <button onClick={() => mutate()} disabled={isLoading}>
-            ↻ 새로고침
-          </button>
           <button onClick={logout}>로그아웃</button>
         </div>
       </aside>
-    </>
-  );
-}
-
-function DirNode({
-  rel,
-  label,
-  depth = 0,
-  selected,
-  expanded,
-  loading,
-  hasChildren,
-  onToggle,
-  onSelect,
-}: {
-  rel: string;
-  label: string;
-  depth?: number;
-  selected: boolean;
-  expanded: boolean;
-  loading: boolean;
-  hasChildren: boolean;
-  onToggle: () => void;
-  onSelect: () => void;
-}) {
-  return (
-    <div
-      className={`dir-node${selected ? " selected" : ""}`}
-      style={{ paddingLeft: 4 + depth * 12 }}
-      role="treeitem"
-      aria-expanded={expanded}
-      aria-selected={selected}
-    >
-      <button
-        type="button"
-        className="twist"
-        onClick={onToggle}
-        aria-label={expanded ? "접기" : "펼치기"}
-        tabIndex={-1}
-      >
-        {loading ? "…" : expanded ? "▾" : hasChildren || !expanded ? "▸" : " "}
-      </button>
-      <button
-        type="button"
-        className="dir-label"
-        onClick={onSelect}
-        title={rel || "/"}
-      >
-        <span className="icon">{expanded ? "📂" : "📁"}</span>
-        <span className="name">{label}</span>
-      </button>
-    </div>
-  );
-}
-
-function DirChildren({
-  parent,
-  entries,
-  expanded,
-  loading,
-  childMap,
-  selected,
-  onToggle,
-  onSelect,
-  depth = 1,
-}: {
-  parent: string;
-  entries: DirEntry[];
-  expanded: Set<string>;
-  loading: Set<string>;
-  childMap: Map<string, DirEntry[]>;
-  selected: string;
-  onToggle: (rel: string) => void;
-  onSelect: (rel: string) => void;
-  depth?: number;
-}) {
-  if (entries.length === 0) {
-    if (loading.has(parent)) {
-      return <div className="dir-empty" style={{ paddingLeft: 4 + depth * 12 }}>불러오는 중…</div>;
-    }
-    return <div className="dir-empty" style={{ paddingLeft: 4 + depth * 12 }}>(하위 디렉토리 없음)</div>;
-  }
-  return (
-    <>
-      {entries.map((child) => {
-        const rel = joinPath(parent, child.name);
-        const isExpanded = expanded.has(rel);
-        const subs = childMap.get(rel) ?? [];
-        return (
-          <div key={rel}>
-            <DirNode
-              rel={rel}
-              label={child.name}
-              depth={depth}
-              selected={selected === rel}
-              expanded={isExpanded}
-              loading={loading.has(rel)}
-              hasChildren={subs.length > 0 || !childMap.has(rel)}
-              onToggle={() => onToggle(rel)}
-              onSelect={() => onSelect(rel)}
-            />
-            {isExpanded && (
-              <DirChildren
-                parent={rel}
-                entries={subs}
-                expanded={expanded}
-                loading={loading}
-                childMap={childMap}
-                selected={selected}
-                onToggle={onToggle}
-                onSelect={onSelect}
-                depth={depth + 1}
-              />
-            )}
-          </div>
-        );
-      })}
     </>
   );
 }

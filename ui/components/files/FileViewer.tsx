@@ -169,6 +169,28 @@ export function FileViewer({ state, onDownload }: Props) {
             language={languageFromPath(state.path)}
             value={state.content}
             theme="vs"
+            onMount={(editor) => {
+              // On touch devices, Monaco's hidden <textarea.inputarea>
+              // grabs focus when the user taps to scroll, which triggers
+              // the on-screen keyboard. The editor is read-only here, so
+              // we make the textarea unable to summon the keyboard.
+              if (
+                typeof window === "undefined" ||
+                !window.matchMedia?.("(pointer: coarse)").matches
+              ) {
+                return;
+              }
+              const root = editor.getDomNode();
+              const ta = root?.querySelector<HTMLTextAreaElement>(
+                "textarea.inputarea",
+              );
+              if (ta) {
+                ta.setAttribute("readonly", "");
+                ta.setAttribute("inputmode", "none");
+                ta.setAttribute("aria-hidden", "true");
+                ta.tabIndex = -1;
+              }
+            }}
             options={{
               readOnly: true,
               domReadOnly: true,

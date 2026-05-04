@@ -9,7 +9,7 @@
     "start": "next start -p 3000",
     "lint": "next lint",
     "typecheck": "tsc --noEmit",
-    "copy-pdf-worker": "node -e \"const fs=require('fs'),path=require('path');const src=require.resolve('pdfjs-dist/build/pdf.worker.min.mjs');const dst=path.join('public','pdfjs','pdf.worker.min.mjs');fs.mkdirSync(path.dirname(dst),{recursive:true});fs.copyFileSync(src,dst);console.log('copied',src,'->',dst);\""
+    "copy-pdf-worker": "node scripts/copy-pdf-worker.mjs"
   },
   "dependencies": {
     "@monaco-editor/react": "^4.7.0",

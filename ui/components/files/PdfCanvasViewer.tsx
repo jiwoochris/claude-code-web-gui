@@ -11,13 +11,56 @@ interface Props {
   src: string;
 }
 
+// pdf.js 5.x calls Uint8Array.prototype.toHex/setFromHex (TC39 Uint8Array
+// base16 methods). iOS Safari < 18.2 and older Chromes don't ship them yet,
+// so installing a tiny polyfill on first load lets pdf.js run on those
+// browsers.
+function polyfillUint8ArrayBase16(): void {
+  const proto = Uint8Array.prototype as Uint8Array & {
+    toHex?: () => string;
+    setFromHex?: (hex: string) => { read: number; written: number };
+  };
+  if (typeof proto.toHex !== "function") {
+    Object.defineProperty(proto, "toHex", {
+      value: function toHex(this: Uint8Array): string {
+        let out = "";
+        for (let i = 0; i < this.length; i++) {
+          out += this[i].toString(16).padStart(2, "0");
+        }
+        return out;
+      },
+      configurable: true,
+      writable: true,
+    });
+  }
+  if (typeof proto.setFromHex !== "function") {
+    Object.defineProperty(proto, "setFromHex", {
+      value: function setFromHex(this: Uint8Array, hex: string) {
+        const clean = hex.length % 2 === 0 ? hex : hex.slice(0, hex.length - 1);
+        const max = Math.min(clean.length / 2, this.length);
+        let read = 0;
+        for (let i = 0; i < max; i++) {
+          const byte = parseInt(clean.substr(i * 2, 2), 16);
+          if (Number.isNaN(byte)) break;
+          this[i] = byte;
+          read = i + 1;
+        }
+        return { read: read * 2, written: read };
+      },
+      configurable: true,
+      writable: true,
+    });
+  }
+}
+
 // Lazy ESM import so the bundle stays out of the initial chunk and Node-only
 // code paths in pdfjs are never reached during SSR. The worker is shipped as
 // a static file under /public/pdfjs/ (see scripts.copy-pdf-worker) so the
 // browser fetches it from the same origin without bundler-specific imports.
 async function loadPdfJs(): Promise<typeof import("pdfjs-dist")> {
+  polyfillUint8ArrayBase16();
   const pdfjs = await import("pdfjs-dist");
-  pdfjs.GlobalWorkerOptions.workerSrc = "/pdfjs/pdf.worker.min.mjs";
+  pdfjs.GlobalWorkerOptions.workerSrc = "/pdfjs/pdf.worker.min.mjs?v=polyfill1";
   return pdfjs;
 }
 

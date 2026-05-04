@@ -3,6 +3,35 @@
 import { useEffect, useRef, useState } from "react";
 import dynamic from "next/dynamic";
 
+const PdfCanvasViewer = dynamic(
+  () => import("./PdfCanvasViewer").then((m) => m.PdfCanvasViewer),
+  { ssr: false, loading: () => <div className="fv-loading">PDF 불러오는 중…</div> },
+);
+
+const MarkdownViewer = dynamic(
+  () => import("./MarkdownViewer").then((m) => m.MarkdownViewer),
+  { ssr: false, loading: () => <div className="fv-loading">마크다운 렌더링…</div> },
+);
+
+function isMarkdownPath(p: string | null): boolean {
+  if (!p) return false;
+  const lower = p.toLowerCase();
+  return lower.endsWith(".md") || lower.endsWith(".mdx") || lower.endsWith(".markdown");
+}
+
+function useIsTouchDevice(): boolean {
+  const [touch, setTouch] = useState(false);
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const mq = window.matchMedia("(pointer: coarse)");
+    const update = () => setTouch(mq.matches);
+    update();
+    mq.addEventListener?.("change", update);
+    return () => mq.removeEventListener?.("change", update);
+  }, []);
+  return touch;
+}
+
 const MonacoEditor = dynamic(async () => {
   // Silence Monaco's worker warning. Read-only previews don't need language
   // workers; the fallback tokenizes on the main thread, which is fine here.
@@ -91,7 +120,9 @@ interface Props {
 
 export function FileViewer({ state, onDownload }: Props) {
   const [mounted, setMounted] = useState(false);
+  const [markdownRaw, setMarkdownRaw] = useState(false);
   const hostRef = useRef<HTMLDivElement>(null);
+  const isTouch = useIsTouchDevice();
 
   useEffect(() => {
     setMounted(true);
@@ -143,11 +174,15 @@ export function FileViewer({ state, onDownload }: Props) {
             ⬇ 다운로드
           </button>
         </div>
-        <iframe
-          className="fv-pdf-frame"
-          src={state.src}
-          title={state.path}
-        />
+        {isTouch ? (
+          <PdfCanvasViewer src={state.src} />
+        ) : (
+          <iframe
+            className="fv-pdf-frame"
+            src={state.src}
+            title={state.path}
+          />
+        )}
       </div>
     );
   }
@@ -185,15 +220,30 @@ export function FileViewer({ state, onDownload }: Props) {
   }
 
   // text
+  const isMd = isMarkdownPath(state.path);
   return (
     <div className="fv-text">
       <div className="fv-toolbar">
         <span className="path" title={state.path}>{state.path}</span>
+        {isMd ? (
+          <button
+            className="btn"
+            onClick={() => setMarkdownRaw((v) => !v)}
+            title="렌더 / 원본 보기 전환"
+          >
+            {markdownRaw ? "📖 렌더" : "📝 원본"}
+          </button>
+        ) : null}
         <span className="spacer" />
         <button className="btn" onClick={() => onDownload(state.path)}>
           ⬇ 다운로드
         </button>
       </div>
+      {isMd && !markdownRaw ? (
+        <div className="fv-md-host">
+          <MarkdownViewer source={state.content} />
+        </div>
+      ) : (
       <div ref={hostRef} className="fv-editor-host">
         {mounted ? (
           <MonacoEditor
@@ -238,6 +288,7 @@ export function FileViewer({ state, onDownload }: Props) {
           />
         ) : null}
       </div>
+      )}
     </div>
   );
 }

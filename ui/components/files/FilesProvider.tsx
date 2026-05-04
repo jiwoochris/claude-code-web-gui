@@ -137,6 +137,79 @@ export function FilesProvider({ children }: { children: React.ReactNode }) {
       URL.revokeObjectURL(imageUrlRef.current);
       imageUrlRef.current = null;
     }
+
+    const dot = relPath.lastIndexOf(".");
+    const ext = dot >= 0 ? relPath.slice(dot + 1).toLowerCase() : "";
+    const PDF_EXTS = new Set(["pdf"]);
+    const OFFICE_EXTS = new Set([
+      "pptx",
+      "ppt",
+      "doc",
+      "docx",
+      "xls",
+      "xlsx",
+      "odt",
+      "odp",
+      "ods",
+      "rtf",
+    ]);
+
+    if (PDF_EXTS.has(ext)) {
+      setPreview({
+        kind: "pdf",
+        path: relPath,
+        src: `/api/fs/file?path=${encodeURIComponent(relPath)}`,
+        renderedFromOffice: false,
+      });
+      return;
+    }
+    if (OFFICE_EXTS.has(ext)) {
+      // Probe the render endpoint: if it succeeds, embed the produced
+      // PDF; otherwise surface a meaningful error so the user can still
+      // download the source file.
+      try {
+        const probe = await fetch(
+          `/api/fs/render?path=${encodeURIComponent(relPath)}`,
+          { method: "HEAD", credentials: "include" },
+        );
+        if (probe.status === 401) {
+          window.location.href = "/login";
+          return;
+        }
+        if (probe.ok) {
+          setPreview({
+            kind: "pdf",
+            path: relPath,
+            src: `/api/fs/render?path=${encodeURIComponent(relPath)}`,
+            renderedFromOffice: true,
+          });
+          return;
+        }
+        if (probe.status === 503) {
+          setPreview({
+            kind: "error",
+            path: relPath,
+            message:
+              "PPT/문서 미리보기를 위해 LibreOffice(soffice)가 서버에 설치되어 있어야 합니다.",
+          });
+          return;
+        }
+        setPreview({
+          kind: "error",
+          path: relPath,
+          message: `미리보기 변환 실패 (HTTP ${probe.status})`,
+        });
+        return;
+      } catch (e) {
+        setPreview({
+          kind: "error",
+          path: relPath,
+          message: (e as Error).message,
+        });
+        return;
+      }
+    }
+
     try {
       const res = await fetch(
         `/api/fs/file?path=${encodeURIComponent(relPath)}`,

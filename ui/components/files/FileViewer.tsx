@@ -80,6 +80,7 @@ export type PreviewState =
   | { kind: "loading"; path: string }
   | { kind: "text"; path: string; content: string }
   | { kind: "image"; path: string; src: string; mime: string }
+  | { kind: "pdf"; path: string; src: string; renderedFromOffice: boolean }
   | { kind: "unavailable"; path: string; reason: "too_large" | "binary"; size: number; mime: string }
   | { kind: "error"; path: string; message: string };
 
@@ -115,6 +116,38 @@ export function FileViewer({ state, onDownload }: Props) {
         <button className="btn" onClick={() => onDownload(state.path)}>
           ⬇ 다운로드 시도
         </button>
+      </div>
+    );
+  }
+
+  if (state.kind === "pdf") {
+    return (
+      <div className="fv-pdf">
+        <div className="fv-toolbar">
+          <span className="path" title={state.path}>{state.path}</span>
+          {state.renderedFromOffice ? (
+            <span className="fv-tag" title="LibreOffice가 PDF로 변환한 미리보기">
+              PDF로 변환됨
+            </span>
+          ) : null}
+          <span className="spacer" />
+          <a
+            className="btn"
+            href={state.src}
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            ↗ 새 탭
+          </a>
+          <button className="btn" onClick={() => onDownload(state.path)}>
+            ⬇ 다운로드
+          </button>
+        </div>
+        <iframe
+          className="fv-pdf-frame"
+          src={state.src}
+          title={state.path}
+        />
       </div>
     );
   }

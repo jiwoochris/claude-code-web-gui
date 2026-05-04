@@ -12,7 +12,19 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 const MAX_PREVIEW_BYTES = 2 * 1024 * 1024;
+const MAX_INLINE_DOC_BYTES = 100 * 1024 * 1024;
 const BINARY_SNIFF_BYTES = 4096;
+
+// Extensions that the browser (or our viewer) can render directly even
+// though they're "binary". For these we skip the NUL-byte check and use
+// a much larger size budget so the iframe can stream the bytes.
+const INLINE_DOC_EXTS = new Set(["pdf"]);
+
+function extOf(p: string): string {
+  const dot = p.lastIndexOf(".");
+  if (dot < 0) return "";
+  return p.slice(dot + 1).toLowerCase();
+}
 
 async function looksBinary(abs: string): Promise<boolean> {
   const fh = await fs.open(abs, "r");
@@ -41,19 +53,29 @@ export async function GET(req: Request) {
     const stat = await fs.stat(abs);
     const mimeType = mime.lookup(abs) || "application/octet-stream";
     const isImage = typeof mimeType === "string" && mimeType.startsWith("image/");
+    const isInlineDoc = INLINE_DOC_EXTS.has(extOf(abs));
 
-    if (!isImage && stat.size > MAX_PREVIEW_BYTES) {
-      return Response.json(
-        { reason: "too_large", size: stat.size, mime: mimeType },
-        { status: 413 },
-      );
-    }
+    if (isInlineDoc) {
+      if (stat.size > MAX_INLINE_DOC_BYTES) {
+        return Response.json(
+          { reason: "too_large", size: stat.size, mime: mimeType },
+          { status: 413 },
+        );
+      }
+    } else {
+      if (!isImage && stat.size > MAX_PREVIEW_BYTES) {
+        return Response.json(
+          { reason: "too_large", size: stat.size, mime: mimeType },
+          { status: 413 },
+        );
+      }
 
-    if (!isImage && (await looksBinary(abs))) {
-      return Response.json(
-        { reason: "binary", size: stat.size, mime: mimeType },
-        { status: 413 },
-      );
+      if (!isImage && (await looksBinary(abs))) {
+        return Response.json(
+          { reason: "binary", size: stat.size, mime: mimeType },
+          { status: 413 },
+        );
+      }
     }
 
     const nodeStream = createReadStream(abs);

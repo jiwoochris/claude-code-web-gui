@@ -223,6 +223,18 @@ export function SessionsSection() {
           setCreateErr("생성에 실패했습니다.");
           return;
         }
+        // Auto-launch `claude` in the new session so the user lands
+        // straight in Claude Code. tmux send-keys queues into the PTY
+        // input buffer, so the shell will pick it up as soon as it
+        // finishes booting — even if our WS attach hasn't happened yet.
+        try {
+          await fetch(`/api/sessions/${encodeURIComponent(name)}/claude`, {
+            method: "POST",
+            credentials: "include",
+          });
+        } catch {
+          /* non-fatal: the user can launch Claude manually */
+        }
         await mutate();
         setCreating(false);
         setNewName("");

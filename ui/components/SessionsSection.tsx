@@ -39,6 +39,28 @@ function joinPath(parent: string, name: string): string {
   return parent ? `${parent}/${name}` : name;
 }
 
+function sanitizeForName(raw: string): string {
+  // Map non-allowed chars to '-', collapse repeats, strip leading/trailing
+  // separators, and keep within the NAME_RE bounds (max 32).
+  let out = raw.replace(/[^a-zA-Z0-9_-]+/g, "-");
+  out = out.replace(/-{2,}/g, "-").replace(/^[-_]+|[-_]+$/g, "");
+  if (out.length > 32) out = out.slice(0, 32);
+  return out;
+}
+
+function uniqueName(base: string, taken: Set<string>): string {
+  if (!taken.has(base)) return base;
+  // base-2, base-3, … with a budget so we never exceed 32 chars.
+  for (let i = 2; i < 1000; i++) {
+    const suffix = `-${i}`;
+    const room = 32 - suffix.length;
+    const trimmed = base.length > room ? base.slice(0, room) : base;
+    const candidate = `${trimmed}${suffix}`;
+    if (!taken.has(candidate)) return candidate;
+  }
+  return base;
+}
+
 export function SessionsSection() {
   const router = useRouter();
   const params = useParams<{ name?: string }>();
@@ -57,6 +79,10 @@ export function SessionsSection() {
   const [createErr, setCreateErr] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
+  // Tracks the last name we auto-filled. We only overwrite the input
+  // while it still matches that suggestion (i.e. the user hasn't typed
+  // their own name yet).
+  const lastAutoRef = useRef<string>("");
 
   // Directory picker (loaded only while create form is open).
   const [rootName, setRootName] = useState<string>("workspace");
@@ -115,12 +141,36 @@ export function SessionsSection() {
     }
   }, [creating, dirChildren, loadDir]);
 
+  // Auto-suggest a session name based on the selected directory. The
+  // suggestion is the directory's basename (rootName when at the root),
+  // sanitized to fit NAME_RE, with -2/-3/... appended if a session
+  // already uses that name. Only overwrites the input while it still
+  // matches the previous suggestion — i.e. before the user typed their
+  // own name.
+  useEffect(() => {
+    if (!creating) return;
+    const segs = selectedCwd ? selectedCwd.split("/").filter(Boolean) : [];
+    const raw = segs.length > 0 ? segs[segs.length - 1] : rootName;
+    const base = sanitizeForName(raw);
+    if (!base) return;
+    const taken = new Set(sessions.map((s) => s.name));
+    const suggestion = uniqueName(base, taken);
+    setNewName((current) => {
+      if (current === "" || current === lastAutoRef.current) {
+        lastAutoRef.current = suggestion;
+        return suggestion;
+      }
+      return current;
+    });
+  }, [creating, selectedCwd, rootName, sessions]);
+
   const startCreate = () => {
     setCreateErr(null);
     setNewName("");
     setSelectedCwd("");
     setDirExpanded(new Set([""]));
     setDirError(null);
+    lastAutoRef.current = "";
     setCreating(true);
   };
 

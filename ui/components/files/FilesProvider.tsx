@@ -14,6 +14,13 @@ import type { PreviewState } from "./FileViewer";
 
 type TreeResponse = { path: string; rootName: string; entries: Entry[] };
 
+export interface UploadProgress {
+  total: number;
+  done: number;
+  active: string | null;
+  errors: { name: string; message: string }[];
+}
+
 interface FilesContextValue {
   rootName: string;
   trees: Map<string, Entry[]>;
@@ -23,6 +30,7 @@ interface FilesContextValue {
   preview: PreviewState;
   watchOk: boolean;
   topError: string | null;
+  upload: UploadProgress | null;
 
   toggleFolder: (relPath: string) => Promise<void>;
   selectFile: (relPath: string) => Promise<void>;
@@ -30,6 +38,11 @@ interface FilesContextValue {
   navigateTo: (relPath: string) => Promise<void>;
   refreshTree: (relPath: string) => Promise<void>;
   download: (relPath: string) => void;
+  uploadFiles: (
+    targetDir: string,
+    files: File[] | FileList,
+  ) => Promise<{ uploaded: number; failed: number }>;
+  resolveDropTarget: (path: string) => string;
 }
 
 const FilesContext = createContext<FilesContextValue | null>(null);
@@ -50,6 +63,7 @@ export function FilesProvider({ children }: { children: React.ReactNode }) {
   const [connId, setConnId] = useState<string | null>(null);
   const [watchOk, setWatchOk] = useState(false);
   const [topError, setTopError] = useState<string | null>(null);
+  const [upload, setUpload] = useState<UploadProgress | null>(null);
 
   const connIdRef = useRef<string | null>(null);
   const selectedRef = useRef<string | null>(null);
@@ -324,6 +338,93 @@ export function FilesProvider({ children }: { children: React.ReactNode }) {
     window.location.href = url;
   }, []);
 
+  // Given a tree path (file or folder), figure out which folder an upload
+  // should land in. Caller passes whatever the user dropped onto.
+  const resolveDropTarget = useCallback((p: string): string => {
+    if (!p) return "";
+    if (treesRef.current.has(p)) return p; // known directory
+    const slash = p.lastIndexOf("/");
+    return slash < 0 ? "" : p.slice(0, slash);
+  }, []);
+
+  const uploadFiles = useCallback(
+    async (targetDir: string, input: File[] | FileList) => {
+      const files: File[] = Array.from(input as ArrayLike<File>).filter(
+        (f) => f && typeof f === "object" && "size" in f,
+      );
+      if (files.length === 0) return { uploaded: 0, failed: 0 };
+
+      setUpload({
+        total: files.length,
+        done: 0,
+        active: files[0]?.name ?? null,
+        errors: [],
+      });
+
+      let uploaded = 0;
+      const errors: { name: string; message: string }[] = [];
+      // Send sequentially so progress is meaningful and we don't blast a
+      // whole drop of dozens of files at the server in parallel.
+      for (let i = 0; i < files.length; i++) {
+        const f = files[i];
+        setUpload((prev) =>
+          prev
+            ? { ...prev, active: f.name, done: i }
+            : prev,
+        );
+        try {
+          const fd = new FormData();
+          fd.append("path", targetDir);
+          fd.append("file", f, f.name);
+          const res = await fetch("/api/fs/upload", {
+            method: "POST",
+            body: fd,
+            credentials: "include",
+          });
+          if (res.status === 401) {
+            window.location.href = "/login";
+            return { uploaded, failed: errors.length + (files.length - i) };
+          }
+          if (!res.ok) {
+            const text = await res.text().catch(() => "");
+            errors.push({
+              name: f.name,
+              message: text || `HTTP ${res.status}`,
+            });
+          } else {
+            uploaded++;
+          }
+        } catch (e) {
+          errors.push({ name: f.name, message: (e as Error).message });
+        }
+      }
+
+      // Refresh the destination tree so the new files appear immediately
+      // even if the SSE watcher is slow or disconnected.
+      await fetchTree(targetDir).catch(() => null);
+
+      setUpload({
+        total: files.length,
+        done: files.length,
+        active: null,
+        errors,
+      });
+      // Auto-clear the toast a few seconds after a clean run.
+      if (errors.length === 0) {
+        setTimeout(() => setUpload(null), 2500);
+      }
+      if (errors.length > 0) {
+        setTopError(
+          `업로드 실패 ${errors.length}건 — ${errors[0].name}: ${errors[0].message}`,
+        );
+      } else {
+        setTopError(null);
+      }
+      return { uploaded, failed: errors.length };
+    },
+    [fetchTree],
+  );
+
   // Initial root tree load.
   useEffect(() => {
     fetchTree("");
@@ -401,6 +502,7 @@ export function FilesProvider({ children }: { children: React.ReactNode }) {
       preview,
       watchOk,
       topError,
+      upload,
       toggleFolder,
       selectFile,
       closeFile,
@@ -409,6 +511,8 @@ export function FilesProvider({ children }: { children: React.ReactNode }) {
         await fetchTree(p);
       },
       download,
+      uploadFiles,
+      resolveDropTarget,
     }),
     [
       rootName,
@@ -419,12 +523,15 @@ export function FilesProvider({ children }: { children: React.ReactNode }) {
       preview,
       watchOk,
       topError,
+      upload,
       toggleFolder,
       selectFile,
       closeFile,
       navigateTo,
       fetchTree,
       download,
+      uploadFiles,
+      resolveDropTarget,
     ],
   );
 

@@ -1413,6 +1413,80 @@ body.col-resizing * {
   display: flex;
   flex-direction: column;
   min-height: 0;
+  position: relative;
+}
+
+.lnb-files.drag-active {
+  outline: 1px dashed var(--accent);
+  outline-offset: -4px;
+}
+
+.lnb-files-dropzone {
+  position: absolute;
+  inset: 0;
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+  z-index: 5;
+}
+
+.lnb-files-dropzone .msg {
+  background: var(--bg-elev-2);
+  border: 1px dashed var(--accent);
+  color: var(--fg);
+  padding: 12px 14px;
+  border-radius: 8px;
+  text-align: center;
+  max-width: 90%;
+}
+
+.lnb-files-dropzone .msg .title {
+  font-weight: 600;
+  font-size: 13px;
+  margin-bottom: 4px;
+}
+
+.lnb-files-dropzone .msg .hint {
+  font-size: 11px;
+  color: var(--fg-muted);
+}
+
+.lnb-files-progress {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  font-size: 11px;
+  color: var(--fg-muted);
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+  border-bottom: 1px solid var(--border);
+}
+
+.lnb-files-progress .spin {
+  display: inline-block;
+  animation: lnb-spin 1s linear infinite;
+  color: var(--accent);
+}
+
+.lnb-files-progress .text.ok {
+  color: var(--ok);
+}
+
+.lnb-files-progress .text.err {
+  color: var(--danger);
+}
+
+@keyframes lnb-spin {
+  to { transform: rotate(360deg); }
+}
+
+.fv-node.drag-target {
+  background: color-mix(in srgb, var(--accent) 25%, transparent);
+  outline: 1px dashed var(--accent);
+  outline-offset: -2px;
 }
 
 .lnb-files-toolbar {

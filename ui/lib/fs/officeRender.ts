@@ -21,7 +21,7 @@ const CACHE_ROOT = path.join(os.tmpdir(), "ccwg-render");
 
 // Bump this when the conversion pipeline changes (font substitution table,
 // soffice flags, etc.) so previously cached PDFs get regenerated.
-const RENDER_PIPELINE_VERSION = "v2-fonts";
+const RENDER_PIPELINE_VERSION = "v3-pretendard-jbmono";
 
 function sofficeBin(): string {
   if (process.env.SOFFICE_BIN) return process.env.SOFFICE_BIN;
@@ -74,16 +74,20 @@ const FONT_SUBSTITUTIONS: ReadonlyArray<readonly [string, string]> = [
   ["Calibri Light", "Carlito"],
   ["Cambria", "Caladea"],
   ["Cambria Math", "Caladea"],
-  ["Consolas", "Menlo"],
-  ["맑은 고딕", "Apple SD Gothic Neo"],
-  ["Malgun Gothic", "Apple SD Gothic Neo"],
+  ["Consolas", "JetBrains Mono"],
+  ["Courier New", "JetBrains Mono"],
+  ["Monaco", "JetBrains Mono"],
+  ["맑은 고딕", "Pretendard"],
+  ["Malgun Gothic", "Pretendard"],
+  ["나눔고딕", "Pretendard"],
+  ["NanumGothic", "Pretendard"],
   ["바탕", "AppleMyungjo"],
   ["Batang", "AppleMyungjo"],
-  ["굴림", "Apple SD Gothic Neo"],
-  ["Gulim", "Apple SD Gothic Neo"],
-  ["돋움", "Apple SD Gothic Neo"],
-  ["Dotum", "Apple SD Gothic Neo"],
-  ["Arial Unicode MS", "Apple SD Gothic Neo"],
+  ["굴림", "Pretendard"],
+  ["Gulim", "Pretendard"],
+  ["돋움", "Pretendard"],
+  ["Dotum", "Pretendard"],
+  ["Arial Unicode MS", "Pretendard"],
   ["Times New Roman", "Times New Roman"],
 ];
 

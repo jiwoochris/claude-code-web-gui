@@ -116,11 +116,11 @@ export type PreviewState =
 interface Props {
   state: PreviewState;
   onDownload: (path: string) => void;
+  markdownRaw?: boolean;
 }
 
-export function FileViewer({ state, onDownload }: Props) {
+export function FileViewer({ state, onDownload, markdownRaw = false }: Props) {
   const [mounted, setMounted] = useState(false);
-  const [markdownRaw, setMarkdownRaw] = useState(false);
   const hostRef = useRef<HTMLDivElement>(null);
   const isTouch = useIsTouchDevice();
 
@@ -154,26 +154,6 @@ export function FileViewer({ state, onDownload }: Props) {
   if (state.kind === "pdf") {
     return (
       <div className="fv-pdf">
-        <div className="fv-toolbar">
-          <span className="path" title={state.path}>{state.path}</span>
-          {state.renderedFromOffice ? (
-            <span className="fv-tag" title="LibreOffice가 PDF로 변환한 미리보기">
-              PDF로 변환됨
-            </span>
-          ) : null}
-          <span className="spacer" />
-          <a
-            className="btn"
-            href={state.src}
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            ↗ 새 탭
-          </a>
-          <button className="btn" onClick={() => onDownload(state.path)}>
-            ⬇ 다운로드
-          </button>
-        </div>
         {isTouch ? (
           <PdfCanvasViewer src={state.src} />
         ) : (
@@ -223,22 +203,6 @@ export function FileViewer({ state, onDownload }: Props) {
   const isMd = isMarkdownPath(state.path);
   return (
     <div className="fv-text">
-      <div className="fv-toolbar">
-        <span className="path" title={state.path}>{state.path}</span>
-        {isMd ? (
-          <button
-            className="btn"
-            onClick={() => setMarkdownRaw((v) => !v)}
-            title="렌더 / 원본 보기 전환"
-          >
-            {markdownRaw ? "📖 렌더" : "📝 원본"}
-          </button>
-        ) : null}
-        <span className="spacer" />
-        <button className="btn" onClick={() => onDownload(state.path)}>
-          ⬇ 다운로드
-        </button>
-      </div>
       {isMd && !markdownRaw ? (
         <div className="fv-md-host">
           <MarkdownViewer source={state.content} />

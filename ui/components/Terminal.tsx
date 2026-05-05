@@ -247,8 +247,9 @@ export function Terminal({ name }: Props) {
       term.loadAddon(fit);
       term.loadAddon(
         new WebLinksAddon((event, uri) => {
-          // Don't hijack selection drags — only act on a real click.
-          if (event.type !== "click" && event.type !== "auxclick") return;
+          // xterm fires activate from mouseup once it has confirmed the
+          // mousedown/mouseup landed on the same link, so we only need to
+          // gate out non-primary buttons here (right-click, etc.).
           if (event.button !== 0 && event.button !== 1) return;
           window.open(uri, "_blank", "noopener,noreferrer");
         }),

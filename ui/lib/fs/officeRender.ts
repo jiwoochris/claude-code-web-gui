@@ -21,7 +21,7 @@ const CACHE_ROOT = path.join(os.tmpdir(), "ccwg-render");
 
 // Bump this when the conversion pipeline changes (font substitution table,
 // soffice flags, etc.) so previously cached PDFs get regenerated.
-const RENDER_PIPELINE_VERSION = "v3-pretendard-jbmono";
+const RENDER_PIPELINE_VERSION = "v4-pretendard-variable";
 
 function sofficeBin(): string {
   if (process.env.SOFFICE_BIN) return process.env.SOFFICE_BIN;
@@ -69,6 +69,14 @@ async function tryAccess(p: string): Promise<boolean> {
 // installed. Without this, missing Office defaults like Calibri or
 // 맑은 고딕 fall back to Liberation Sans / DejaVu and Hangul glyphs go
 // missing on PDF export.
+//
+// We target "Pretendard Variable" (the single-file variable font) instead
+// of the static OTF family. The static distribution registers each weight
+// other than Regular/Bold under its own typographic family name
+// ("Pretendard SemiBold", "Pretendard Medium", …), so LibreOffice only
+// sees Regular + Bold inside the "Pretendard" family and silently drops
+// SemiBold/Medium/Light requests. The variable font exposes the full
+// 100–900 weight axis under one family.
 const FONT_SUBSTITUTIONS: ReadonlyArray<readonly [string, string]> = [
   ["Calibri", "Carlito"],
   ["Calibri Light", "Carlito"],
@@ -77,17 +85,18 @@ const FONT_SUBSTITUTIONS: ReadonlyArray<readonly [string, string]> = [
   ["Consolas", "JetBrains Mono"],
   ["Courier New", "JetBrains Mono"],
   ["Monaco", "JetBrains Mono"],
-  ["맑은 고딕", "Pretendard"],
-  ["Malgun Gothic", "Pretendard"],
-  ["나눔고딕", "Pretendard"],
-  ["NanumGothic", "Pretendard"],
+  ["맑은 고딕", "Pretendard Variable"],
+  ["Malgun Gothic", "Pretendard Variable"],
+  ["나눔고딕", "Pretendard Variable"],
+  ["NanumGothic", "Pretendard Variable"],
+  ["Pretendard", "Pretendard Variable"],
   ["바탕", "AppleMyungjo"],
   ["Batang", "AppleMyungjo"],
-  ["굴림", "Pretendard"],
-  ["Gulim", "Pretendard"],
-  ["돋움", "Pretendard"],
-  ["Dotum", "Pretendard"],
-  ["Arial Unicode MS", "Pretendard"],
+  ["굴림", "Pretendard Variable"],
+  ["Gulim", "Pretendard Variable"],
+  ["돋움", "Pretendard Variable"],
+  ["Dotum", "Pretendard Variable"],
+  ["Arial Unicode MS", "Pretendard Variable"],
   ["Times New Roman", "Times New Roman"],
 ];
 

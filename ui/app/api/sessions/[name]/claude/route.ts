@@ -33,15 +33,16 @@ export async function POST(
       await sendLine(name, "claude");
     } else {
       // Discard whatever the user has half-typed in the Claude TUI input box
-      // before injecting "/clear". Esc cancels in-progress streaming and
-      // clears the prompt buffer; without it we'd just append to the user's
-      // pending text. Two presses cover the "Esc-to-cancel-stream, Esc again
-      // to clear input" path. Then a short pause lets the TUI re-render an
-      // empty input before the slash command + Enter arrive together as one
-      // batch (otherwise Enter can land while the input is still settling
-      // and the TUI ignores it).
+      // before injecting "/clear". A single Esc cancels in-progress streaming
+      // or clears the partial input; a *second* Esc opens Claude's rewind /
+      // previous-message selector, which would then swallow the "/clear"
+      // text. Follow up with C-u to drain any leftover readline buffer in
+      // case Esc was a no-op (idle + empty input). The short pause lets the
+      // TUI re-render an empty input before the slash command + Enter arrive
+      // together as one batch (otherwise Enter can land while the input is
+      // still settling and the TUI ignores it).
       await sendKey(name, "Escape");
-      await sendKey(name, "Escape");
+      await sendKey(name, "C-u");
       await new Promise((r) => setTimeout(r, 120));
       await sendLine(name, "/clear");
     }

@@ -323,11 +323,14 @@ export function Terminal({ name }: Props) {
       termRef.current = term;
       fitRef.current = fit;
 
-      // Shift+Enter sends the CSI u sequence ESC[13;2u — the same encoding
-      // `/terminal-setup` configures in iTerm2/VS Code/WezTerm, and what
-      // current Claude Code expects to distinguish Shift+Enter from a bare
-      // Enter (which still submits). The older ESC+CR (Alt+Enter) sequence
-      // no longer reliably inserts a newline in recent Claude Code builds.
+      // Shift+Enter sends the literal backslash + CR pair (0x5c 0x0d).
+      // Claude Code's input parser treats `\` immediately followed by Enter
+      // as "insert newline, don't submit" in every terminal regardless of
+      // keyboard-protocol negotiation. The CSI u variant (ESC[13;2u) only
+      // works once Claude Code has DECSET kitty keyboard mode and the
+      // terminal chain (xterm.js -> tmux -> claude) all agree on the
+      // protocol — fragile in our setup. The backslash-Enter convention is
+      // what `/terminal-setup` configures iTerm2/VS Code/WezTerm to emit.
       // Ctrl+C copies the current selection when there is one (otherwise it
       // falls through as SIGINT). Ctrl+V pastes from the browser clipboard.
       const isCoarsePointer =
@@ -366,7 +369,7 @@ export function Terminal({ name }: Props) {
         ) {
           const ws = wsRef.current;
           if (ws && ws.readyState === WebSocket.OPEN) {
-            ws.send(new TextEncoder().encode("\x1b[13;2u"));
+            ws.send(new TextEncoder().encode("\\\r"));
           }
           return false;
         }

@@ -9,6 +9,10 @@ import type {
 
 interface Props {
   src: string;
+  // Per-slide speaker notes, in slide order. notes[i] is rendered below
+  // page i+1 if non-empty. Updates after the document is rendered are
+  // applied without re-rendering the canvases.
+  notes?: string[];
 }
 
 // pdf.js 5.x calls Uint8Array.prototype.toHex/setFromHex (TC39 Uint8Array
@@ -64,13 +68,30 @@ async function loadPdfJs(): Promise<typeof import("pdfjs-dist")> {
   return pdfjs;
 }
 
-export function PdfCanvasViewer({ src }: Props) {
+export function PdfCanvasViewer({ src, notes }: Props) {
   const hostRef = useRef<HTMLDivElement>(null);
+  const noteNodesRef = useRef<HTMLDivElement[]>([]);
   const [status, setStatus] = useState<"loading" | "ready" | "error">(
     "loading",
   );
   const [error, setError] = useState<string | null>(null);
   const [pageCount, setPageCount] = useState(0);
+
+  // Re-apply notes whenever they change without re-rendering canvases.
+  useEffect(() => {
+    for (let i = 0; i < noteNodesRef.current.length; i++) {
+      const node = noteNodesRef.current[i];
+      if (!node) continue;
+      const text = notes?.[i]?.trim() ?? "";
+      if (text) {
+        node.textContent = text;
+        node.style.display = "";
+      } else {
+        node.textContent = "";
+        node.style.display = "none";
+      }
+    }
+  }, [notes, pageCount, status]);
 
   useEffect(() => {
     let cancelled = false;
@@ -81,6 +102,7 @@ export function PdfCanvasViewer({ src }: Props) {
     setError(null);
     setPageCount(0);
     if (hostRef.current) hostRef.current.innerHTML = "";
+    noteNodesRef.current = [];
 
     (async () => {
       try {
@@ -114,13 +136,29 @@ export function PdfCanvasViewer({ src }: Props) {
           const scale = cssWidth / viewportBase.width;
           const viewport = page.getViewport({ scale });
 
+          const slot = document.createElement("div");
+          slot.className = "fv-pdf-slot";
+          slot.style.width = `${Math.floor(viewport.width)}px`;
+          host.appendChild(slot);
+
           const canvas = document.createElement("canvas");
           canvas.className = "fv-pdf-page";
           canvas.width = Math.floor(viewport.width * dpr);
           canvas.height = Math.floor(viewport.height * dpr);
           canvas.style.width = `${Math.floor(viewport.width)}px`;
           canvas.style.height = `${Math.floor(viewport.height)}px`;
-          host.appendChild(canvas);
+          slot.appendChild(canvas);
+
+          const noteNode = document.createElement("div");
+          noteNode.className = "fv-pdf-note";
+          const initialNote = notes?.[pageNum - 1]?.trim() ?? "";
+          if (initialNote) {
+            noteNode.textContent = initialNote;
+          } else {
+            noteNode.style.display = "none";
+          }
+          slot.appendChild(noteNode);
+          noteNodesRef.current[pageNum - 1] = noteNode;
 
           const ctx = canvas.getContext("2d");
           if (!ctx) {

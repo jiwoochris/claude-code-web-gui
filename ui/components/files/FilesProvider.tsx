@@ -174,6 +174,7 @@ export function FilesProvider({ children }: { children: React.ReactNode }) {
         path: relPath,
         src: `/api/fs/file?path=${encodeURIComponent(relPath)}`,
         renderedFromOffice: false,
+        sourceExt: "pdf",
       });
       return;
     }
@@ -196,7 +197,33 @@ export function FilesProvider({ children }: { children: React.ReactNode }) {
             path: relPath,
             src: `/api/fs/render?path=${encodeURIComponent(relPath)}`,
             renderedFromOffice: true,
+            sourceExt: ext,
           });
+          if (ext === "pptx") {
+            // Fetch speaker notes asynchronously and merge into the preview
+            // when they arrive. The PDF itself is usable without notes, so
+            // any failure here is silent.
+            void fetch(
+              `/api/fs/pptx-notes?path=${encodeURIComponent(relPath)}`,
+              { credentials: "include" },
+            )
+              .then(async (r) => {
+                if (!r.ok) return null;
+                return (await r.json()) as { notes: string[] };
+              })
+              .then((data) => {
+                if (!data) return;
+                if (selectedRef.current !== relPath) return;
+                setPreview((prev) =>
+                  prev.kind === "pdf" && prev.path === relPath
+                    ? { ...prev, notes: data.notes }
+                    : prev,
+                );
+              })
+              .catch(() => {
+                /* notes are best-effort */
+              });
+          }
           return;
         }
         if (probe.status === 503) {

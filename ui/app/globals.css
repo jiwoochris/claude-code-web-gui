@@ -1252,6 +1252,28 @@ body.col-resizing * {
   box-shadow: 0 1px 4px rgba(0, 0, 0, 0.4);
 }
 
+.fv-pdf-slot {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  max-width: 100%;
+  gap: 0;
+}
+
+.fv-pdf-note {
+  background: #fffbe6;
+  color: #1b1f27;
+  border: 1px solid #e0d28a;
+  border-top: none;
+  border-radius: 0 0 4px 4px;
+  padding: 10px 14px;
+  font-size: 13px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.4);
+}
+
 .fv-md-host {
   flex: 1;
   min-height: 0;

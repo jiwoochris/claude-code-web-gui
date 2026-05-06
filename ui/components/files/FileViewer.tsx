@@ -109,7 +109,14 @@ export type PreviewState =
   | { kind: "loading"; path: string }
   | { kind: "text"; path: string; content: string }
   | { kind: "image"; path: string; src: string; mime: string }
-  | { kind: "pdf"; path: string; src: string; renderedFromOffice: boolean }
+  | {
+      kind: "pdf";
+      path: string;
+      src: string;
+      renderedFromOffice: boolean;
+      sourceExt?: string;
+      notes?: string[];
+    }
   | { kind: "unavailable"; path: string; reason: "too_large" | "binary"; size: number; mime: string }
   | { kind: "error"; path: string; message: string };
 
@@ -152,10 +159,14 @@ export function FileViewer({ state, onDownload, markdownRaw = false }: Props) {
   }
 
   if (state.kind === "pdf") {
+    // For pptx renders we always use the canvas viewer so per-slide speaker
+    // notes can be inlined under each page. Other PDFs keep the native
+    // browser viewer on desktop for its zoom/search controls.
+    const useCanvas = isTouch || state.sourceExt === "pptx";
     return (
       <div className="fv-pdf">
-        {isTouch ? (
-          <PdfCanvasViewer src={state.src} />
+        {useCanvas ? (
+          <PdfCanvasViewer src={state.src} notes={state.notes} />
         ) : (
           <iframe
             className="fv-pdf-frame"

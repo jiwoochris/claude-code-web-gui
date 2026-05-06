@@ -367,6 +367,14 @@ export function Terminal({ name }: Props) {
           !ev.altKey &&
           !ev.metaKey
         ) {
+          // Returning false from xterm's custom handler stops xterm's own
+          // processing but does NOT cancel the browser default — the hidden
+          // textarea would otherwise insert "\n" and xterm would forward
+          // that as a stray byte right after our manual "\\\r", which
+          // Claude Code then sees as a submit. preventDefault keeps the
+          // textarea silent so only our two bytes reach the pty.
+          ev.preventDefault();
+          ev.stopPropagation();
           const ws = wsRef.current;
           if (ws && ws.readyState === WebSocket.OPEN) {
             ws.send(new TextEncoder().encode("\\\r"));

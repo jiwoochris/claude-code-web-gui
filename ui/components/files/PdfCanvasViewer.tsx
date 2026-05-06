@@ -70,12 +70,57 @@ async function loadPdfJs(): Promise<typeof import("pdfjs-dist")> {
 
 export function PdfCanvasViewer({ src, notes }: Props) {
   const hostRef = useRef<HTMLDivElement>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
   const noteNodesRef = useRef<HTMLDivElement[]>([]);
+  const slotsRef = useRef<HTMLDivElement[]>([]);
   const [status, setStatus] = useState<"loading" | "ready" | "error">(
     "loading",
   );
   const [error, setError] = useState<string | null>(null);
   const [pageCount, setPageCount] = useState(0);
+  const [currentPage, setCurrentPage] = useState(1);
+
+  // Track which slide is most visible inside the scroll container so the
+  // page indicator can mirror "page X of Y" without controlling scroll.
+  useEffect(() => {
+    if (status !== "ready" || pageCount === 0) return;
+    const root = scrollRef.current;
+    if (!root) return;
+
+    const ratios = new Map<number, number>();
+    const observer = new IntersectionObserver(
+      (entries) => {
+        for (const entry of entries) {
+          const page = Number(
+            (entry.target as HTMLElement).dataset.page || "0",
+          );
+          if (!page) continue;
+          ratios.set(page, entry.intersectionRatio);
+        }
+        let bestPage = 0;
+        let bestRatio = -1;
+        for (const [page, ratio] of ratios) {
+          if (ratio > bestRatio) {
+            bestRatio = ratio;
+            bestPage = page;
+          }
+        }
+        if (bestPage > 0) setCurrentPage(bestPage);
+      },
+      {
+        root,
+        // Steps so a slide that's only partly in view still reports a
+        // ratio we can compare against its neighbors.
+        threshold: [0, 0.1, 0.25, 0.5, 0.75, 1],
+      },
+    );
+
+    for (const slot of slotsRef.current) {
+      if (slot) observer.observe(slot);
+    }
+
+    return () => observer.disconnect();
+  }, [status, pageCount]);
 
   // Re-apply notes whenever they change without re-rendering canvases.
   useEffect(() => {
@@ -101,8 +146,10 @@ export function PdfCanvasViewer({ src, notes }: Props) {
     setStatus("loading");
     setError(null);
     setPageCount(0);
+    setCurrentPage(1);
     if (hostRef.current) hostRef.current.innerHTML = "";
     noteNodesRef.current = [];
+    slotsRef.current = [];
 
     (async () => {
       try {
@@ -139,7 +186,9 @@ export function PdfCanvasViewer({ src, notes }: Props) {
           const slot = document.createElement("div");
           slot.className = "fv-pdf-slot";
           slot.style.width = `${Math.floor(viewport.width)}px`;
+          slot.dataset.page = String(pageNum);
           host.appendChild(slot);
+          slotsRef.current[pageNum - 1] = slot;
 
           const canvas = document.createElement("canvas");
           canvas.className = "fv-pdf-page";
@@ -207,18 +256,25 @@ export function PdfCanvasViewer({ src, notes }: Props) {
   }, [src]);
 
   return (
-    <div className="fv-pdf-canvas">
-      {status === "loading" ? (
-        <div className="fv-loading">PDF 불러오는 중…</div>
+    <div className="fv-pdf-wrap">
+      <div className="fv-pdf-canvas" ref={scrollRef}>
+        {status === "loading" ? (
+          <div className="fv-loading">PDF 불러오는 중…</div>
+        ) : null}
+        {status === "error" ? (
+          <div className="err">PDF 표시 실패: {error}</div>
+        ) : null}
+        <div
+          ref={hostRef}
+          className="fv-pdf-pages"
+          data-pages={pageCount || undefined}
+        />
+      </div>
+      {status === "ready" && pageCount > 0 ? (
+        <div className="fv-pdf-pageind">
+          {currentPage} / {pageCount}
+        </div>
       ) : null}
-      {status === "error" ? (
-        <div className="err">PDF 표시 실패: {error}</div>
-      ) : null}
-      <div
-        ref={hostRef}
-        className="fv-pdf-pages"
-        data-pages={pageCount || undefined}
-      />
     </div>
   );
 }

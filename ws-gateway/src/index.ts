@@ -39,6 +39,28 @@ if (!SESSION_SECRET || SESSION_SECRET.length < 32) {
   process.exit(1);
 }
 
+// Force tmux server-wide options the webgui depends on:
+//   - extended-keys on:           parse CSI u modified-key sequences
+//   - terminal-features extkeys:  pass them through to inner panes
+// Without these, the browser's `\x1b[13;2u` for Shift+Enter is stripped by
+// tmux and Claude Code only sees a bare CR (== submit), which defeats the
+// newline shortcut the web terminal advertises. Idempotent and silent on
+// failure — if tmux isn't reachable yet there's nothing to configure.
+async function ensureTmuxExtendedKeys(): Promise<void> {
+  try {
+    await execFileP("tmux", ["set-option", "-g", "extended-keys", "on"]);
+    await execFileP("tmux", [
+      "set-option",
+      "-gas",
+      "terminal-features",
+      "xterm*:extkeys",
+    ]);
+  } catch {
+    /* tmux server may not be running yet; the next tmux invocation will
+       inherit options from ~/.tmux.conf when the server actually starts */
+  }
+}
+
 function log(level: "info" | "warn" | "error", event: string, extra?: Record<string, unknown>) {
   const line = JSON.stringify({
     ts: new Date().toISOString(),
@@ -423,6 +445,7 @@ wss.on("connection", (ws: WebSocket, req: http.IncomingMessage, sessionName: str
 
 server.listen(PORT, () => {
   log("info", "ws.boot.listen", { port: PORT, allowedOrigins: ALLOWED_ORIGINS });
+  void ensureTmuxExtendedKeys();
 });
 
 function shutdown(signal: string) {

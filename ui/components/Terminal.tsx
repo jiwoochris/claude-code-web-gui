@@ -254,6 +254,61 @@ export function Terminal({ name }: Props) {
           window.open(uri, "_blank", "noopener,noreferrer");
         }),
       );
+
+      // Markdown-style link provider: makes `[label](https://…)` clickable on
+      // the *label* too, not just the bare URL inside the parens. The default
+      // WebLinksAddon only detects exposed URLs, so when Claude prints output
+      // like "[열기](https://…)" the user sees rendered-looking markdown but
+      // clicking the label does nothing. We map string indices back to cell
+      // columns so wide chars (Korean, CJK) line up correctly.
+      const MD_LINK = /\[([^\]\n]+?)\]\((https?:\/\/[^\s)]+)\)/g;
+      term.registerLinkProvider({
+        provideLinks(bufferLineNumber, callback) {
+          const t = termRef.current;
+          if (!t) return callback(undefined);
+          const line = t.buffer.active.getLine(bufferLineNumber - 1);
+          if (!line) return callback(undefined);
+
+          const charStartCol: number[] = [];
+          const charEndCol: number[] = [];
+          const chars: string[] = [];
+          for (let x = 0; x < line.length; x++) {
+            const cell = line.getCell(x);
+            if (!cell) continue;
+            const w = cell.getWidth();
+            if (w === 0) continue; // continuation cell of a wide char
+            const ch = cell.getChars();
+            chars.push(ch === "" ? " " : ch);
+            charStartCol.push(x + 1);
+            charEndCol.push(x + (w === 2 ? 2 : 1));
+          }
+          const text = chars.join("");
+
+          const links: import("@xterm/xterm").ILink[] = [];
+          MD_LINK.lastIndex = 0;
+          let m: RegExpExecArray | null;
+          while ((m = MD_LINK.exec(text)) !== null) {
+            const startIdx = m.index;
+            const endIdx = m.index + m[0].length - 1;
+            if (startIdx >= chars.length || endIdx >= chars.length) continue;
+            const url = m[2];
+            links.push({
+              range: {
+                start: { x: charStartCol[startIdx], y: bufferLineNumber },
+                end: { x: charEndCol[endIdx], y: bufferLineNumber },
+              },
+              text: m[0],
+              activate: (event) => {
+                if (event.button !== 0 && event.button !== 1) return;
+                window.open(url, "_blank", "noopener,noreferrer");
+              },
+            });
+          }
+
+          callback(links.length ? links : undefined);
+        },
+      });
+
       term.open(host);
 
       try {

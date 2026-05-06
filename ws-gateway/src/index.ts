@@ -40,15 +40,31 @@ if (!SESSION_SECRET || SESSION_SECRET.length < 32) {
 }
 
 // Force tmux server-wide options the webgui depends on:
-//   - extended-keys on:           parse CSI u modified-key sequences
-//   - terminal-features extkeys:  pass them through to inner panes
-// Without these, the browser's `\x1b[13;2u` for Shift+Enter is stripped by
-// tmux and Claude Code only sees a bare CR (== submit), which defeats the
-// newline shortcut the web terminal advertises. Idempotent and silent on
-// failure — if tmux isn't reachable yet there's nothing to configure.
+//   - extended-keys always:           always forward CSI u modified-key
+//                                     sequences to inner panes (the default
+//                                     `on` only forwards when the app DECSETs
+//                                     extended keys, which Claude Code may
+//                                     not do early enough)
+//   - extended-keys-format csi-u:     keep the wire format as ESC[13;2u
+//                                     instead of tmux's default xterm
+//                                     `ESC[27;2;13~`, which Claude Code's
+//                                     input parser does NOT treat as
+//                                     Shift+Enter
+//   - terminal-features extkeys:      declare CSI u capability on tmux's
+//                                     outer xterm-256color terminfo entry
+// Without all three, the browser's ESC[13;2u for Shift+Enter is dropped or
+// rewritten by tmux and Claude Code only sees a bare CR (== submit).
+// Idempotent and silent on failure — if tmux isn't reachable yet there's
+// nothing to configure.
 async function ensureTmuxExtendedKeys(): Promise<void> {
   try {
-    await execFileP("tmux", ["set-option", "-g", "extended-keys", "on"]);
+    await execFileP("tmux", ["set-option", "-g", "extended-keys", "always"]);
+    await execFileP("tmux", [
+      "set-option",
+      "-g",
+      "extended-keys-format",
+      "csi-u",
+    ]);
     await execFileP("tmux", [
       "set-option",
       "-gas",

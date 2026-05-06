@@ -268,13 +268,13 @@ export function Terminal({ name }: Props) {
       termRef.current = term;
       fitRef.current = fit;
 
-      // Shift+Enter sends ESC+CR (the same sequence native terminals like
-      // iTerm/Terminal.app emit for Alt/Shift+Enter). TUIs such as Claude
-      // Code treat this as "insert newline" while a bare CR still submits.
-      // A lone LF is dropped by some TUIs inside tmux, which is why the
-      // web GUI's old `\n` payload didn't work. Ctrl+C copies the current
-      // selection when there is one (otherwise it falls through as SIGINT).
-      // Ctrl+V pastes from the browser clipboard.
+      // Shift+Enter sends the CSI u sequence ESC[13;2u — the same encoding
+      // `/terminal-setup` configures in iTerm2/VS Code/WezTerm, and what
+      // current Claude Code expects to distinguish Shift+Enter from a bare
+      // Enter (which still submits). The older ESC+CR (Alt+Enter) sequence
+      // no longer reliably inserts a newline in recent Claude Code builds.
+      // Ctrl+C copies the current selection when there is one (otherwise it
+      // falls through as SIGINT). Ctrl+V pastes from the browser clipboard.
       const isCoarsePointer =
         typeof window !== "undefined" &&
         window.matchMedia?.("(pointer: coarse)").matches;
@@ -311,7 +311,7 @@ export function Terminal({ name }: Props) {
         ) {
           const ws = wsRef.current;
           if (ws && ws.readyState === WebSocket.OPEN) {
-            ws.send(new TextEncoder().encode("\x1b\r"));
+            ws.send(new TextEncoder().encode("\x1b[13;2u"));
           }
           return false;
         }

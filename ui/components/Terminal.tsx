@@ -375,10 +375,22 @@ export function Terminal({ name }: Props) {
           // textarea silent so only our two bytes reach the pty.
           ev.preventDefault();
           ev.stopPropagation();
-          const ws = wsRef.current;
-          if (ws && ws.readyState === WebSocket.OPEN) {
-            ws.send(new TextEncoder().encode("\\\r"));
-          }
+          // Defer the actual send by one task tick. When a Korean IME (or
+          // any other composing IME) is on the last character of a run,
+          // the browser commits that character on the Enter keydown and
+          // fires the `input` event immediately after our handler. If we
+          // send "\\\r" synchronously here, the committed character (e.g.
+          // the "요" in "안녕하세요") arrives at the pty AFTER our newline
+          // payload — Claude Code then renders it as `안녕하세\n요`. A
+          // setTimeout 0 lets the input event flush the composed text via
+          // term.onData first, so the bytes hit the pty in the right
+          // order: composed text, then newline.
+          setTimeout(() => {
+            const ws = wsRef.current;
+            if (ws && ws.readyState === WebSocket.OPEN) {
+              ws.send(new TextEncoder().encode("\\\r"));
+            }
+          }, 0);
           return false;
         }
 

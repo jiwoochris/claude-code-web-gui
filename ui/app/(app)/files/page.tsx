@@ -3,6 +3,7 @@
 import { useState } from "react";
 import { useFiles } from "@/components/files/FilesProvider";
 import { FileViewer } from "@/components/files/FileViewer";
+import { FileTabs } from "@/components/files/FileTabs";
 import { Breadcrumb } from "@/components/files/Breadcrumb";
 
 export default function FilesPage() {
@@ -80,6 +81,8 @@ export default function FilesPage() {
           ⬇ ZIP
         </button>
       </div>
+
+      <FileTabs />
 
       <div className="fv-pane-right" style={{ flex: 1, minHeight: 0 }}>
         <FileViewer

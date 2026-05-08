@@ -28,6 +28,7 @@ interface FilesContextValue {
   expanded: Set<string>;
   selected: string | null;
   preview: PreviewState;
+  recentFiles: string[];
   watchOk: boolean;
   topError: string | null;
   upload: UploadProgress | null;
@@ -35,6 +36,7 @@ interface FilesContextValue {
   toggleFolder: (relPath: string) => Promise<void>;
   selectFile: (relPath: string) => Promise<void>;
   closeFile: () => void;
+  closeRecent: (relPath: string) => void;
   navigateTo: (relPath: string) => Promise<void>;
   refreshTree: (relPath: string) => Promise<void>;
   download: (relPath: string) => void;
@@ -44,6 +46,9 @@ interface FilesContextValue {
   ) => Promise<{ uploaded: number; failed: number }>;
   resolveDropTarget: (path: string) => string;
 }
+
+const RECENT_FILES_LIMIT = 5;
+const RECENT_FILES_STORAGE_KEY = "files-recent:v1";
 
 const FilesContext = createContext<FilesContextValue | null>(null);
 
@@ -60,6 +65,7 @@ export function FilesProvider({ children }: { children: React.ReactNode }) {
   const [loading, setLoading] = useState<Set<string>>(() => new Set());
   const [selected, setSelected] = useState<string | null>(null);
   const [preview, setPreview] = useState<PreviewState>({ kind: "empty" });
+  const [recentFiles, setRecentFiles] = useState<string[]>([]);
   const [connId, setConnId] = useState<string | null>(null);
   const [watchOk, setWatchOk] = useState(false);
   const [topError, setTopError] = useState<string | null>(null);
@@ -70,6 +76,8 @@ export function FilesProvider({ children }: { children: React.ReactNode }) {
   const expandedRef = useRef<Set<string>>(new Set([""]));
   const treesRef = useRef<Map<string, Entry[]>>(new Map());
   const imageUrlRef = useRef<string | null>(null);
+  const recentFilesRef = useRef<string[]>([]);
+  const recentHydratedRef = useRef(false);
 
   useEffect(() => {
     connIdRef.current = connId;
@@ -83,6 +91,41 @@ export function FilesProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     treesRef.current = trees;
   }, [trees]);
+  useEffect(() => {
+    recentFilesRef.current = recentFiles;
+  }, [recentFiles]);
+
+  // Hydrate recent files from localStorage once on mount.
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(RECENT_FILES_STORAGE_KEY);
+      if (raw) {
+        const arr = JSON.parse(raw) as unknown;
+        if (Array.isArray(arr)) {
+          const clean = arr
+            .filter((v): v is string => typeof v === "string" && v.length > 0)
+            .slice(0, RECENT_FILES_LIMIT);
+          if (clean.length > 0) setRecentFiles(clean);
+        }
+      }
+    } catch {
+      /* ignore */
+    }
+    recentHydratedRef.current = true;
+  }, []);
+
+  // Persist recent files after hydration so initial mount doesn't clobber.
+  useEffect(() => {
+    if (!recentHydratedRef.current) return;
+    try {
+      localStorage.setItem(
+        RECENT_FILES_STORAGE_KEY,
+        JSON.stringify(recentFiles),
+      );
+    } catch {
+      /* ignore */
+    }
+  }, [recentFiles]);
 
   const markLoading = useCallback((p: string, on: boolean) => {
     setLoading((prev) => {
@@ -292,22 +335,57 @@ export function FilesProvider({ children }: { children: React.ReactNode }) {
     async (relPath: string) => {
       const prev = selectedRef.current;
       if (prev && prev !== relPath) subscribeWatch(prev, "file", "remove");
+      setRecentFiles((list) => {
+        const filtered = list.filter((p) => p !== relPath);
+        return [relPath, ...filtered].slice(0, RECENT_FILES_LIMIT);
+      });
       await openFile(relPath);
       subscribeWatch(relPath, "file", "add");
     },
     [openFile, subscribeWatch],
   );
 
+  // Removes `path` from the recent list. If it was the active file, switch to
+  // a neighboring tab (the one that takes its index) or fall back to empty.
+  const closeRecent = useCallback(
+    (path: string) => {
+      const list = recentFilesRef.current;
+      const idx = list.indexOf(path);
+      if (idx < 0) return;
+      const remaining = list.filter((p) => p !== path);
+      setRecentFiles(remaining);
+      if (selectedRef.current !== path) return;
+      subscribeWatch(path, "file", "remove");
+      if (imageUrlRef.current) {
+        URL.revokeObjectURL(imageUrlRef.current);
+        imageUrlRef.current = null;
+      }
+      if (remaining.length === 0) {
+        setSelected(null);
+        setPreview({ kind: "empty" });
+        return;
+      }
+      const nextIdx = Math.min(idx, remaining.length - 1);
+      const next = remaining[nextIdx];
+      void openFile(next);
+      subscribeWatch(next, "file", "add");
+    },
+    [openFile, subscribeWatch],
+  );
+
   const closeFile = useCallback(() => {
-    const prev = selectedRef.current;
-    if (prev) subscribeWatch(prev, "file", "remove");
+    const cur = selectedRef.current;
+    if (cur) {
+      closeRecent(cur);
+      return;
+    }
     if (imageUrlRef.current) {
       URL.revokeObjectURL(imageUrlRef.current);
       imageUrlRef.current = null;
     }
     setSelected(null);
     setPreview({ kind: "empty" });
-  }, [subscribeWatch]);
+  }, [closeRecent]);
 
   const toggleFolder = useCallback(
     async (relPath: string) => {
@@ -527,12 +605,14 @@ export function FilesProvider({ children }: { children: React.ReactNode }) {
       expanded,
       selected,
       preview,
+      recentFiles,
       watchOk,
       topError,
       upload,
       toggleFolder,
       selectFile,
       closeFile,
+      closeRecent,
       navigateTo,
       refreshTree: async (p: string) => {
         await fetchTree(p);
@@ -548,12 +628,14 @@ export function FilesProvider({ children }: { children: React.ReactNode }) {
       expanded,
       selected,
       preview,
+      recentFiles,
       watchOk,
       topError,
       upload,
       toggleFolder,
       selectFile,
       closeFile,
+      closeRecent,
       navigateTo,
       fetchTree,
       download,

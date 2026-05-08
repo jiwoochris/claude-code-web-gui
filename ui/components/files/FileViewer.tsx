@@ -229,7 +229,7 @@ export function FileViewer({
     <div className="fv-text">
       {isMd && !markdownRaw ? (
         <div className="fv-md-host">
-          <MarkdownViewer source={state.content} />
+          <MarkdownViewer source={state.content} basePath={state.path} />
         </div>
       ) : isHtml && !htmlRaw ? (
         <iframe

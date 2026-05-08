@@ -255,7 +255,7 @@ async function synthesizeViaOpenRouter(text: string): Promise<BriefingAudio> {
           {
             role: "system",
             content:
-              "You speak the user's text aloud verbatim in a natural, conversational Korean broadcast tone. Do not paraphrase, summarize, translate, comment, or add anything — read it as-is.",
+              "Read the user's Korean text aloud as if you were casually telling a friend what just happened — natural spoken Korean, conversational rhythm and intonation. Keep the meaning faithful (do not invent facts), but you may smooth out written phrasing into spoken phrasing: skip stray markdown/bullet/code symbols, drop awkward written-only conjunctions, and lightly rephrase clunky sentences so they sound like speech, not narration of a document. Do not add new information, opinions, intros, or outros. Output Korean only.",
           },
           { role: "user", content: text },
         ],

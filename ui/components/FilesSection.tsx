@@ -1,10 +1,13 @@
 "use client";
 
 import { useCallback, useRef, useState } from "react";
+import { usePathname, useRouter } from "next/navigation";
 import { useFiles } from "./files/FilesProvider";
 import { FileTree } from "./files/FileTree";
 
 export function FilesSection() {
+  const router = useRouter();
+  const pathname = usePathname();
   const {
     rootName,
     trees,
@@ -20,6 +23,20 @@ export function FilesSection() {
     uploadFiles,
     resolveDropTarget,
   } = useFiles();
+
+  // The file viewer only renders on /s/[name] (split with terminal) and
+  // /files (standalone). On the dashboard or any other route, clicking a
+  // file in the LNB would otherwise update state silently with nowhere
+  // to display — route to /files in that case.
+  const handleSelectFile = useCallback(
+    async (path: string) => {
+      if (pathname && !pathname.startsWith("/s/") && pathname !== "/files") {
+        router.push("/files");
+      }
+      await selectFile(path);
+    },
+    [pathname, router, selectFile],
+  );
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [dragActive, setDragActive] = useState(false);
@@ -151,7 +168,7 @@ export function FilesSection() {
           expanded={expanded}
           selected={selected}
           onToggleFolder={toggleFolder}
-          onSelectFile={selectFile}
+          onSelectFile={handleSelectFile}
           onContextMenu={(e, path, type) => {
             e.preventDefault();
             if (type === "dir" || type === "file") {

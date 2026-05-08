@@ -1,4 +1,7 @@
 import http from "node:http";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { WebSocketServer, type WebSocket } from "ws";
@@ -438,6 +441,25 @@ wss.on("connection", (ws: WebSocket, req: http.IncomingMessage, sessionName: str
   let sessionMissing = false;
   let stderrBuf = "";
 
+  // Recover markdown labels → URLs from the project's transcript JSONL
+  // files (Claude Code's TUI doesn't emit URLs on the wire). The cwd
+  // lookup is async, so the watcher arms a moment after the pty does;
+  // that's fine because labels become clickable on the next poll tick.
+  let linkWatcher: TranscriptLinkWatcher | null = null;
+  void (async () => {
+    const cwd = await getPaneCwd(sessionName);
+    if (!cwd || ws.readyState !== ws.OPEN) return;
+    const dir = cwdToTranscriptDir(cwd);
+    linkWatcher = startTranscriptLinkWatcher(dir, (entries) => {
+      if (ws.readyState !== ws.OPEN) return;
+      try {
+        ws.send(JSON.stringify({ type: "link_map", entries }));
+      } catch {
+        /* socket closed mid-send */
+      }
+    });
+  })();
+
   const onDataDisposable = term.onData((data) => {
     // tmux may print "can't find session: X" then exit with code 1.
     if (!sessionMissing && /can't find session|no sessions|session not found/i.test(data)) {
@@ -628,6 +650,14 @@ wss.on("connection", (ws: WebSocket, req: http.IncomingMessage, sessionName: str
     clearInterval(pingTimer);
     onDataDisposable.dispose();
     onExitDisposable.dispose();
+    if (linkWatcher) {
+      try {
+        linkWatcher.close();
+      } catch {
+        /* noop */
+      }
+      linkWatcher = null;
+    }
     if (!ptyExited) {
       try {
         term.kill();
@@ -660,6 +690,197 @@ server.listen(PORT, () => {
   log("info", "ws.boot.listen", { port: PORT, allowedOrigins: ALLOWED_ORIGINS });
   void ensureTmuxExtendedKeys();
 });
+
+// ── Transcript-based markdown-link recovery ─────────────────────────
+// Claude Code's TUI deliberately doesn't put the URL of `[label](url)`
+// onto the wire — only the styled label glyphs reach xterm. The full
+// markdown text *is* recorded in the per-project session transcript at
+// ~/.claude/projects/<cwd-key>/<session>.jsonl, so we tail those JSONL
+// files, pull `[label](url)` pairs out of every assistant turn, and
+// push the mapping over ws as `{type:"link_map", entries:[…]}`. The
+// browser then matches the visible label glyphs to those entries and
+// registers an xterm ILink on top of them.
+//
+// Polling instead of fs.watch — fs.watch on macOS is flaky for tail-
+// like workloads, and the 1.5s latency here is fine (a label only
+// becomes clickable a beat after the assistant message finishes
+// rendering, which is when the user actually reaches for it anyway).
+
+const TRANSCRIPT_POLL_MS = 1500;
+const TRANSCRIPT_LINK_RE = /\[([^\]\n]+?)\]\((https?:\/\/[^\s)]+)\)/g;
+
+function cwdToTranscriptDir(cwd: string): string {
+  // Claude Code maps cwd to ~/.claude/projects/<key>/ where <key> is
+  // the path with `/` replaced by `-`. (Verified against existing
+  // directories on disk.)
+  return path.join(
+    os.homedir(),
+    ".claude",
+    "projects",
+    cwd.replace(/\//g, "-"),
+  );
+}
+
+interface LinkEntry {
+  label: string;
+  url: string;
+}
+
+function extractMdLinks(text: string): LinkEntry[] {
+  const out: LinkEntry[] = [];
+  TRANSCRIPT_LINK_RE.lastIndex = 0;
+  let m: RegExpExecArray | null;
+  while ((m = TRANSCRIPT_LINK_RE.exec(text)) !== null) {
+    out.push({ label: m[1], url: m[2] });
+  }
+  return out;
+}
+
+interface TranscriptLinkWatcher {
+  close: () => void;
+}
+
+async function getPaneCwd(sessionName: string): Promise<string | null> {
+  try {
+    const { stdout } = await execFileP("tmux", [
+      "display-message",
+      "-p",
+      "-t",
+      sessionName,
+      "#{pane_current_path}",
+    ]);
+    const p = stdout.trim();
+    return p.length > 0 ? p : null;
+  } catch {
+    return null;
+  }
+}
+
+function startTranscriptLinkWatcher(
+  dir: string,
+  onBatch: (entries: LinkEntry[]) => void,
+): TranscriptLinkWatcher {
+  const offsets = new Map<string, number>();
+  // Dedupe by label — assistant turns get re-rendered on edits/resumes,
+  // and the same `[캘린더에서 보기](…)` label easily appears in many
+  // transcripts. We only need the *first* URL we see per label.
+  const seenLabels = new Set<string>();
+
+  const emit = (raw: LinkEntry[]) => {
+    const fresh: LinkEntry[] = [];
+    for (const e of raw) {
+      if (seenLabels.has(e.label)) continue;
+      seenLabels.add(e.label);
+      fresh.push(e);
+    }
+    if (fresh.length > 0) onBatch(fresh);
+  };
+
+  const harvestSlice = (text: string) => {
+    const entries: LinkEntry[] = [];
+    for (const line of text.split("\n")) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      let obj: unknown;
+      try {
+        obj = JSON.parse(trimmed);
+      } catch {
+        continue;
+      }
+      const o = obj as {
+        type?: string;
+        message?: { content?: Array<{ type?: string; text?: string }> };
+      };
+      if (o?.type !== "assistant") continue;
+      const content = o?.message?.content;
+      if (!Array.isArray(content)) continue;
+      for (const c of content) {
+        if (c?.type === "text" && typeof c.text === "string") {
+          entries.push(...extractMdLinks(c.text));
+        }
+      }
+    }
+    if (entries.length > 0) emit(entries);
+  };
+
+  const processFile = (fp: string) => {
+    let size: number;
+    try {
+      size = fs.statSync(fp).size;
+    } catch {
+      return;
+    }
+    const off = offsets.get(fp) ?? 0;
+    if (size <= off) {
+      offsets.set(fp, size);
+      return;
+    }
+    let buf: Buffer;
+    let fd: number;
+    try {
+      fd = fs.openSync(fp, "r");
+    } catch {
+      return;
+    }
+    try {
+      buf = Buffer.alloc(size - off);
+      fs.readSync(fd, buf, 0, buf.length, off);
+    } finally {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        /* noop */
+      }
+    }
+    const text = buf.toString("utf8");
+    const lastNl = text.lastIndexOf("\n");
+    if (lastNl < 0) {
+      // Wait for a complete line — don't advance the offset.
+      return;
+    }
+    offsets.set(fp, off + Buffer.byteLength(text.slice(0, lastNl + 1), "utf8"));
+    harvestSlice(text.slice(0, lastNl));
+  };
+
+  // Initial pass: read every existing transcript from byte 0 so the
+  // browser receives labels for prior turns too (scrollback labels stay
+  // clickable).
+  try {
+    if (fs.existsSync(dir)) {
+      for (const f of fs.readdirSync(dir)) {
+        if (!f.endsWith(".jsonl")) continue;
+        const fp = path.join(dir, f);
+        offsets.set(fp, 0);
+        processFile(fp);
+      }
+    }
+  } catch {
+    /* directory missing or unreadable — nothing to do yet */
+  }
+
+  const interval = setInterval(() => {
+    try {
+      if (!fs.existsSync(dir)) return;
+      for (const f of fs.readdirSync(dir)) {
+        if (!f.endsWith(".jsonl")) continue;
+        const fp = path.join(dir, f);
+        if (!offsets.has(fp)) {
+          // New file appeared after we started watching — read from 0.
+          offsets.set(fp, 0);
+        }
+        processFile(fp);
+      }
+    } catch {
+      /* ignore transient FS errors */
+    }
+  }, TRANSCRIPT_POLL_MS);
+
+  return {
+    close: () => {
+      clearInterval(interval);
+    },
+  };
+}
 
 function shutdown(signal: string) {
   log("info", "ws.boot.shutdown", { signal });

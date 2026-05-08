@@ -65,6 +65,11 @@ export function Terminal({ name }: Props) {
   // rendering.
   const lastTermDataAtRef = useRef<number>(0);
   const termBytesReceivedRef = useRef<number>(0);
+  // label → URL map populated from `link_map` messages pushed by ws-gateway.
+  // The TUI strips URLs out of `[label](url)` before they reach xterm, so
+  // we recover them from the project's session transcript and look up the
+  // matching label glyphs whenever xterm asks for links on a buffer line.
+  const linkMapRef = useRef<Map<string, string>>(new Map());
 
   const sendResize = useCallback(() => {
     const ws = wsRef.current;
@@ -139,6 +144,27 @@ export function Terminal({ name }: Props) {
                 clearTimeout(pending.timer);
                 briefingPendingRef.current = null;
                 pending.resolve(msg as BriefingMsg);
+              }
+              return;
+            }
+            if (msg?.type === "link_map" && Array.isArray(msg.entries)) {
+              let added = false;
+              for (const e of msg.entries) {
+                if (
+                  typeof e?.label === "string" &&
+                  typeof e?.url === "string" &&
+                  !linkMapRef.current.has(e.label)
+                ) {
+                  linkMapRef.current.set(e.label, e.url);
+                  added = true;
+                }
+              }
+              if (added) {
+                // Force xterm to re-evaluate link providers across the
+                // visible viewport so newly-known labels become clickable
+                // without needing a redraw from the pty.
+                const term = termRef.current;
+                if (term) term.refresh(0, term.rows - 1);
               }
               return;
             }
@@ -391,6 +417,61 @@ export function Terminal({ name }: Props) {
                 });
               }
               segStart = segEnd + 1;
+            }
+          }
+
+          // Transcript-recovered labels: Claude Code's TUI strips the
+          // URL out of `[label](url)` before it hits xterm, so we recover
+          // the mapping from the project's session transcript (pushed by
+          // ws-gateway as `link_map`) and look up the visible label
+          // glyphs here. Same per-buffer-line segmentation as above.
+          if (linkMapRef.current.size > 0) {
+            const pushSegmentedLink = (
+              startIdx: number,
+              endIdx: number,
+              url: string,
+            ) => {
+              let segStart = startIdx;
+              while (segStart <= endIdx) {
+                const segLine = cellLine[segStart];
+                let segEnd = segStart;
+                while (
+                  segEnd + 1 <= endIdx &&
+                  cellLine[segEnd + 1] === segLine
+                ) {
+                  segEnd += 1;
+                }
+                if (segLine === bufferLineNumber) {
+                  links.push({
+                    range: {
+                      start: {
+                        x: cellStartCol[segStart],
+                        y: bufferLineNumber,
+                      },
+                      end: { x: cellEndCol[segEnd], y: bufferLineNumber },
+                    },
+                    text: text.slice(segStart, segEnd + 1),
+                    activate: (event) => {
+                      if (event.button !== 0 && event.button !== 1) return;
+                      window.open(url, "_blank", "noopener,noreferrer");
+                    },
+                  });
+                }
+                segStart = segEnd + 1;
+              }
+            };
+
+            for (const [label, url] of linkMapRef.current) {
+              if (!label) continue;
+              let from = 0;
+              while (from < text.length) {
+                const idx = text.indexOf(label, from);
+                if (idx < 0) break;
+                const endIdx = idx + label.length - 1;
+                from = endIdx + 1;
+                if (endIdx >= chars.length) break;
+                pushSegmentedLink(idx, endIdx, url);
+              }
             }
           }
 

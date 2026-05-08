@@ -137,10 +137,14 @@ const CLAUDE_PROJECTS_DIR = path.join(
   process.env.CLAUDE_PROJECTS_DIR ?? path.join(os.homedir(), ".claude", "projects"),
 );
 
+// Sent via /btw so the briefing turn doesn't pollute the main thread's
+// context. Tool use isn't disabled here — /btw runs as a side question and
+// generally answers from existing context — but we still nudge it toward a
+// short spoken-style answer.
+const BRIEFING_SIDE_COMMAND = "/btw";
 const BRIEFING_PROMPT =
   "방금까지 우리가 나눈 대화를 라디오 진행자처럼 자연스럽고 짧게 한국어 대화체로 브리핑해줘. " +
-  "어떤 도구도 호출하지 말고 즉시 답하고, 마크다운·코드블록·불릿·이모지 없이, " +
-  "음성으로 들었을 때 자연스러운 2~4문장으로만.";
+  "마크다운·코드블록·불릿·이모지 없이, 음성으로 들었을 때 자연스러운 2~4문장으로만.";
 
 const BRIEFING_TOTAL_TIMEOUT_MS = 90_000;
 const BRIEFING_SETTLE_MS = 1_800;
@@ -275,10 +279,84 @@ async function statSize(p: string): Promise<number> {
   }
 }
 
+// Snapshot byte-size of every .jsonl in the project dir before we inject the
+// briefing prompt, so we can later look for new content across the main
+// transcript *and* any sidechain file that /btw might write.
+async function snapshotProjectTranscripts(
+  projectDir: string,
+): Promise<Map<string, number>> {
+  const sizes = new Map<string, number>();
+  let entries: string[];
+  try {
+    entries = await fs.readdir(projectDir);
+  } catch {
+    return sizes;
+  }
+  for (const name of entries) {
+    if (!name.endsWith(".jsonl")) continue;
+    const full = path.join(projectDir, name);
+    try {
+      const st = await fs.stat(full);
+      if (!st.isFile()) continue;
+      sizes.set(full, st.size);
+    } catch {
+      /* ignore */
+    }
+  }
+  return sizes;
+}
+
+interface NewAssistantHit {
+  text: string;
+  jsonlPath: string;
+  mtimeMs: number;
+}
+
+async function readNewAssistantTextSinceSnapshot(
+  projectDir: string,
+  snapshot: Map<string, number>,
+): Promise<NewAssistantHit | null> {
+  let entries: string[];
+  try {
+    entries = await fs.readdir(projectDir);
+  } catch {
+    return null;
+  }
+  let best: NewAssistantHit | null = null;
+  for (const name of entries) {
+    if (!name.endsWith(".jsonl")) continue;
+    const full = path.join(projectDir, name);
+    let st;
+    try {
+      st = await fs.stat(full);
+    } catch {
+      continue;
+    }
+    if (!st.isFile()) continue;
+    const startByte = snapshot.get(full) ?? 0;
+    if (st.size <= startByte) continue;
+    const text = await readLastAssistantTextSince(full, startByte);
+    if (!text) continue;
+    if (!best || st.mtimeMs > best.mtimeMs) {
+      best = { text, jsonlPath: full, mtimeMs: st.mtimeMs };
+    }
+  }
+  return best;
+}
+
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 async function tmuxSendKeys(sessionName: string, ...keys: string[]): Promise<void> {
   await execFileP("tmux", ["send-keys", "-t", sessionName, ...keys]);
+}
+
+// `tmux send-keys -l` treats every argument as literal text — no key-name
+// parsing. Required for prompts containing multibyte chars or characters
+// that happen to overlap tmux's key-name tokens (e.g. "Enter" inside a
+// sentence). The Enter that submits the prompt must be sent as a *separate*
+// send-keys call without -l so tmux interprets it as the Enter key.
+async function tmuxSendLiteral(sessionName: string, text: string): Promise<void> {
+  await execFileP("tmux", ["send-keys", "-t", sessionName, "-l", text]);
 }
 
 async function tmuxPaneCommand(sessionName: string): Promise<string | null> {
@@ -297,28 +375,32 @@ async function tmuxPaneCommand(sessionName: string): Promise<string | null> {
   }
 }
 
-// Inject a fresh prompt into the Claude TUI. Mirrors the /clear path in the
-// UI's claude API route — Esc cancels any in-flight stream / clears partial
-// input, C-u drains the readline buffer, then a short pause lets the input
-// box re-render before we type.
+// Inject a fresh `/btw <prompt>` into the Claude TUI. Mirrors the /clear
+// path in the UI's claude API route — Esc cancels any in-flight stream /
+// clears partial input, C-u drains the readline buffer, a short pause lets
+// the input box re-render, then we send the literal text and Enter as two
+// distinct send-keys calls so the multibyte payload doesn't trip tmux's
+// key-name parser.
 async function injectBriefingPrompt(sessionName: string): Promise<void> {
   await tmuxSendKeys(sessionName, "Escape");
   await tmuxSendKeys(sessionName, "C-u");
   await sleep(150);
-  await tmuxSendKeys(sessionName, BRIEFING_PROMPT, "Enter");
+  await tmuxSendLiteral(sessionName, `${BRIEFING_SIDE_COMMAND} ${BRIEFING_PROMPT}`);
+  await sleep(80);
+  await tmuxSendKeys(sessionName, "Enter");
 }
 
 async function waitForBriefingResponse(
-  jsonlPath: string,
-  startByte: number,
+  projectDir: string,
+  snapshot: Map<string, number>,
 ): Promise<string | null> {
   const deadline = Date.now() + BRIEFING_TOTAL_TIMEOUT_MS;
   let lastText: string | null = null;
   let lastSeenAt = Date.now();
   while (Date.now() < deadline) {
-    const text = await readLastAssistantTextSince(jsonlPath, startByte);
-    if (text && text !== lastText) {
-      lastText = text;
+    const hit = await readNewAssistantTextSinceSnapshot(projectDir, snapshot);
+    if (hit && hit.text !== lastText) {
+      lastText = hit.text;
       lastSeenAt = Date.now();
     }
     if (lastText && Date.now() - lastSeenAt >= BRIEFING_SETTLE_MS) {
@@ -387,8 +469,8 @@ async function runBriefing(sessionName: string): Promise<BriefingResult> {
   const cwd = await tmuxPanePath(sessionName);
   if (!cwd) return { ok: false, reason: "no_pane_path" };
   const projectDir = path.join(CLAUDE_PROJECTS_DIR, encodeProjectDir(cwd));
-  const jsonl = await findLatestJsonl(projectDir);
-  if (!jsonl) return { ok: false, reason: "no_transcript" };
+  const latestJsonl = await findLatestJsonl(projectDir);
+  if (!latestJsonl) return { ok: false, reason: "no_transcript" };
 
   // tmux's `pane_current_command` reports the *name* of the foreground proc,
   // which on macOS comes from p_comm. Claude Code sets its proc name to its
@@ -409,14 +491,17 @@ async function runBriefing(sessionName: string): Promise<BriefingResult> {
     return { ok: false, reason: "no_api_key" };
   }
 
-  const startByte = await statSize(jsonl);
+  // /btw may either append to the main transcript or write to a sidechain
+  // .jsonl in the same project dir, so snapshot every .jsonl up front and
+  // diff after.
+  const snapshot = await snapshotProjectTranscripts(projectDir);
   try {
     await injectBriefingPrompt(sessionName);
   } catch (err) {
     return { ok: false, reason: `tmux_send_failed:${(err as Error).message}` };
   }
 
-  const text = await waitForBriefingResponse(jsonl, startByte);
+  const text = await waitForBriefingResponse(projectDir, snapshot);
   if (!text) return { ok: false, reason: "no_assistant_text" };
 
   try {

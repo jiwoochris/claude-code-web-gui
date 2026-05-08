@@ -234,6 +234,14 @@ export function PdfCanvasViewer({ src, notes }: Props) {
           // Keep memory bounded for long decks on phones.
           disableAutoFetch: true,
           disableStream: false,
+          // CIDFont character-code → glyph maps. PPTX-converted PDFs that
+          // use Korean text reference predefined CMaps like KSCms-UHC-H;
+          // without these files pdf.js can't decode the codes and renders
+          // Hangul as random ASCII letters. Files are copied into
+          // /public/pdfjs/ by scripts/copy-pdf-worker.mjs.
+          cMapUrl: "/pdfjs/cmaps/",
+          cMapPacked: true,
+          standardFontDataUrl: "/pdfjs/standard_fonts/",
         });
         doc = await loadingTask.promise;
         if (cancelled) return;

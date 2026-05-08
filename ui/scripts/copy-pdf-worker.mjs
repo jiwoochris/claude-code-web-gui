@@ -1,27 +1,48 @@
-// Copies pdf.js's worker into /public/pdfjs/ and prepends polyfills for
-// recent TC39 methods that pdfjs-dist 5.x relies on but which iOS Safari
-// < 18.4 and older Chromes don't ship yet:
+// Copies pdf.js's worker + companion data into /public/pdfjs/ and prepends
+// polyfills for recent TC39 methods that pdfjs-dist 5.x relies on but which
+// iOS Safari < 18.4 and older Chromes don't ship yet:
 //   - Uint8Array#toHex / setFromHex   (base16 methods)
 //   - Map#getOrInsertComputed         (upsert proposal, also on WeakMap)
 // Without these the worker blows up mid-parse with errors like
 // "a.toHex is not a function" or "this[#rP].getOrInsertComputed is not
 // a function" and the whole PDF/PPTX preview fails to render.
+//
+// The cmaps/ + standard_fonts/ directories are needed at runtime for any
+// PDF that uses CID-keyed fonts (Korean/Japanese/Chinese CIDs reference
+// predefined CMaps like KSCms-UHC-H) or one of the 14 standard PDF fonts.
+// Without them pdf.js can't decode character codes back to glyphs and
+// renders Korean text as random ASCII letters.
 
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
-import { mkdirSync, copyFileSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  mkdirSync,
+  copyFileSync,
+  readFileSync,
+  writeFileSync,
+  rmSync,
+  cpSync,
+} from "node:fs";
 import { dirname, join, resolve } from "node:path";
 
 const require = createRequire(import.meta.url);
 const here = dirname(fileURLToPath(import.meta.url));
 const pkgRoot = resolve(here, "..");
 
-const src = require.resolve("pdfjs-dist/build/pdf.worker.min.mjs");
+const workerSrc = require.resolve("pdfjs-dist/build/pdf.worker.min.mjs");
+const pdfjsRoot = resolve(workerSrc, "..", "..");
 const dstDir = join(pkgRoot, "public", "pdfjs");
 const dst = join(dstDir, "pdf.worker.min.mjs");
 
 mkdirSync(dstDir, { recursive: true });
-copyFileSync(src, dst);
+copyFileSync(workerSrc, dst);
+
+for (const dir of ["cmaps", "standard_fonts"]) {
+  const from = join(pdfjsRoot, dir);
+  const to = join(dstDir, dir);
+  rmSync(to, { recursive: true, force: true });
+  cpSync(from, to, { recursive: true });
+}
 
 const polyfill = `/* injected: polyfills for pdfjs-dist 5.x on older browsers */
 (() => {
@@ -79,4 +100,5 @@ const original = readFileSync(dst, "utf8");
 if (!original.startsWith(polyfill)) {
   writeFileSync(dst, polyfill + original, "utf8");
 }
-console.log("copied + polyfilled", src, "->", dst);
+console.log("copied + polyfilled", workerSrc, "->", dst);
+console.log("copied cmaps + standard_fonts ->", dstDir);

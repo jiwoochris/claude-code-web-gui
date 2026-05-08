@@ -545,6 +545,7 @@ wss.on("connection", (ws: WebSocket, req: http.IncomingMessage, sessionName: str
           ip,
           sessionName,
           chars: text.length,
+          preview: text.slice(0, 200),
         });
         void runBriefingSynth(text)
           .then((res) => {

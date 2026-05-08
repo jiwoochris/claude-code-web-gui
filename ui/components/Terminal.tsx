@@ -903,12 +903,18 @@ export function Terminal({ name }: Props) {
     // visible answer out of the xterm buffer. /btw doesn't write to
     // ~/.claude/projects/*.jsonl, so the buffer is the only source of truth.
     setBanner("Claude의 답변을 기다리는 중…");
-    await waitForTerminalSettle(injectAt, 2_000, 60_000);
+    await waitForTerminalSettle(injectAt, 3_500, 90_000);
     const scraped = extractLastAssistantText();
     if (!scraped) {
       setBanner("브리핑 응답을 화면에서 찾지 못했습니다.");
       setBriefingState("idle");
       return;
+    }
+    // Surface the scraped text so we can see *exactly* what's about to be
+    // read aloud — useful when the audio plays but the content is wrong.
+    if (typeof window !== "undefined") {
+      // eslint-disable-next-line no-console
+      console.info("[briefing] scraped %d chars:\n%s", scraped.length, scraped);
     }
 
     // Phase 3: synthesize via OpenRouter on the gateway.

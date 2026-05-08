@@ -42,13 +42,20 @@ export function Terminal({ name }: Props) {
     rows: 40,
   });
   const [banner, setBanner] = useState<string | null>(null);
-  const [speaking, setSpeaking] = useState(false);
+  const [briefingState, setBriefingState] = useState<"idle" | "loading" | "playing">(
+    "idle",
+  );
   const [claudeBusy, setClaudeBusy] = useState(false);
+  type BriefingResponse =
+    | { type: "briefing_audio"; audio: string; mime: string; text?: string }
+    | { type: "briefing_error"; reason?: string; text?: string };
   const briefingPendingRef = useRef<{
     id: string;
-    resolve: (text: string | null) => void;
+    resolve: (msg: BriefingResponse | null) => void;
     timer: ReturnType<typeof setTimeout>;
   } | null>(null);
+  const briefingAudioRef = useRef<HTMLAudioElement | null>(null);
+  const briefingAudioUrlRef = useRef<string | null>(null);
 
   const sendResize = useCallback(() => {
     const ws = wsRef.current;
@@ -113,12 +120,12 @@ export function Terminal({ name }: Props) {
           try {
             const msg = JSON.parse(ev.data);
             if (msg?.type === "ping" || msg?.type === "pong") return;
-            if (msg?.type === "briefing") {
+            if (msg?.type === "briefing_audio" || msg?.type === "briefing_error") {
               const pending = briefingPendingRef.current;
               if (pending && (!msg.id || msg.id === pending.id)) {
                 clearTimeout(pending.timer);
                 briefingPendingRef.current = null;
-                pending.resolve(typeof msg.text === "string" ? msg.text : null);
+                pending.resolve(msg as BriefingResponse);
               }
               return;
             }
@@ -507,67 +514,25 @@ export function Terminal({ name }: Props) {
     void connect();
   };
 
-  const extractLastAssistantText = useCallback((): string => {
-    const term = termRef.current;
-    if (!term) return "";
-    const buf = term.buffer.active;
-    const raw: string[] = [];
-    for (let i = 0; i < buf.length; i++) {
-      const line = buf.getLine(i);
-      raw.push(line ? line.translateToString(true) : "");
-    }
-
-    const BOX_CHARS_G = /[│┃╭╮╰╯─━└┘┌┐╔╗╚╝║═┏┓┗┛┃]/g;
-    const BOX_TOP_CHARS = /[╭┌╔┏]/;
-    const isBoxOrEmpty = (s: string) => {
-      const t = s.trim();
-      if (t === "") return true;
-      const stripped = t.replace(BOX_CHARS_G, "").trim();
-      return stripped === "" || /^[╭╮╰╯┌┐└┘┏┓┗┛]/.test(t);
-    };
-
-    // Claude Code TUI renders the input box (╭─╮ │>│ ╰─╯) plus a status
-    // footer ("? for shortcuts", model name, …) at the very bottom of the
-    // pane. Without skipping past the box's top edge, the trailing
-    // "trim box-or-empty" pass stops at the footer (plain text, not a box
-    // line) and we'd end up speaking the footer instead of the assistant's
-    // last reply. So: find the top edge of the most recent input box and
-    // treat everything from there downward as chrome.
-    let boxTop = -1;
-    for (let i = raw.length - 1; i >= 0; i--) {
-      if (BOX_TOP_CHARS.test(raw[i])) {
-        boxTop = i;
-        break;
+  const stopBriefingAudio = useCallback(() => {
+    const audio = briefingAudioRef.current;
+    if (audio) {
+      try {
+        audio.pause();
+      } catch {
+        /* noop */
       }
+      audio.src = "";
+      briefingAudioRef.current = null;
     }
-
-    let end = boxTop >= 0 ? boxTop : raw.length;
-    while (end > 0 && isBoxOrEmpty(raw[end - 1])) end--;
-
-    let start = end;
-    for (let i = end - 1; i >= 0; i--) {
-      if (isBoxOrEmpty(raw[i])) {
-        start = i + 1;
-        break;
-      }
-      const t = raw[i].replace(BOX_CHARS_G, "").trim();
-      if (/^>\s/.test(t)) {
-        start = i + 1;
-        break;
-      }
-      start = i;
+    const url = briefingAudioUrlRef.current;
+    if (url) {
+      URL.revokeObjectURL(url);
+      briefingAudioUrlRef.current = null;
     }
-
-    const cleaned = raw
-      .slice(start, end)
-      .map((l) => l.replace(BOX_CHARS_G, "").replace(/^\s+|\s+$/g, ""))
-      .filter((l) => l !== "")
-      .join(" ");
-
-    return cleaned.slice(0, 1200);
   }, []);
 
-  const requestTranscriptBriefing = useCallback((): Promise<string | null> => {
+  const requestBriefing = useCallback((): Promise<BriefingResponse | null> => {
     const ws = wsRef.current;
     if (!ws || ws.readyState !== WebSocket.OPEN) return Promise.resolve(null);
     const prev = briefingPendingRef.current;
@@ -576,17 +541,19 @@ export function Terminal({ name }: Props) {
       prev.resolve(null);
       briefingPendingRef.current = null;
     }
-    return new Promise<string | null>((resolve) => {
+    return new Promise<BriefingResponse | null>((resolve) => {
       const id =
         (typeof crypto !== "undefined" && "randomUUID" in crypto
           ? crypto.randomUUID()
           : Math.random().toString(36).slice(2));
+      // Total budget = Claude reply + OpenRouter synth + slack. ws-gateway's
+      // own deadline is 90s; we add ~30s for the TTS round-trip.
       const timer = setTimeout(() => {
         if (briefingPendingRef.current?.id === id) {
           briefingPendingRef.current = null;
           resolve(null);
         }
-      }, 3000);
+      }, 120_000);
       briefingPendingRef.current = { id, resolve, timer };
       try {
         ws.send(JSON.stringify({ type: "briefing", id }));
@@ -598,16 +565,34 @@ export function Terminal({ name }: Props) {
     });
   }, []);
 
-  const speakText = useCallback((text: string) => {
-    const synth = window.speechSynthesis;
-    const utter = new SpeechSynthesisUtterance(text);
-    utter.lang = "ko-KR";
-    utter.rate = 1.05;
-    utter.onend = () => setSpeaking(false);
-    utter.onerror = () => setSpeaking(false);
-    setSpeaking(true);
-    synth.speak(utter);
-  }, []);
+  const playBase64Audio = useCallback(
+    (base64: string, mime: string): Promise<void> => {
+      stopBriefingAudio();
+      const bin = atob(base64);
+      const buf = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) buf[i] = bin.charCodeAt(i);
+      const blob = new Blob([buf], { type: mime });
+      const url = URL.createObjectURL(blob);
+      briefingAudioUrlRef.current = url;
+      const audio = new Audio(url);
+      briefingAudioRef.current = audio;
+      return new Promise<void>((resolve, reject) => {
+        audio.onended = () => {
+          stopBriefingAudio();
+          resolve();
+        };
+        audio.onerror = () => {
+          stopBriefingAudio();
+          reject(new Error("audio playback failed"));
+        };
+        audio.play().catch((err) => {
+          stopBriefingAudio();
+          reject(err);
+        });
+      });
+    },
+    [stopBriefingAudio],
+  );
 
   const toggleClaude = useCallback(async () => {
     if (claudeBusy) return;
@@ -637,38 +622,66 @@ export function Terminal({ name }: Props) {
   }, [claudeBusy, name, router]);
 
   const toggleBriefing = useCallback(async () => {
-    if (typeof window === "undefined" || !("speechSynthesis" in window)) {
-      setBanner("이 브라우저는 음성 합성을 지원하지 않습니다.");
+    if (briefingState === "playing") {
+      stopBriefingAudio();
+      setBriefingState("idle");
       return;
     }
-    const synth = window.speechSynthesis;
-    if (synth.speaking || synth.pending) {
-      synth.cancel();
-      setSpeaking(false);
+    if (briefingState === "loading") return;
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      setBanner("WebSocket이 연결되어 있지 않습니다.");
       return;
     }
 
-    const transcriptText = await requestTranscriptBriefing();
-    const text = transcriptText ?? extractLastAssistantText();
-    if (!text) {
-      setBanner("읽을 답변을 찾지 못했습니다.");
-      return;
+    setBriefingState("loading");
+    setBanner("Claude가 브리핑을 준비 중입니다…");
+    const reasonMessages: Record<string, string> = {
+      no_pane_path: "세션 작업 디렉터리를 찾지 못했습니다.",
+      no_transcript: "Claude 대화 기록을 찾지 못했습니다.",
+      claude_not_running: "이 세션에서 Claude Code가 실행 중이 아닙니다.",
+      no_api_key: "OPENROUTER_API_KEY가 설정되어 있지 않습니다.",
+      no_assistant_text: "Claude의 브리핑 응답을 시간 내에 받지 못했습니다.",
+    };
+    try {
+      const res = await requestBriefing();
+      if (!res) {
+        setBanner("브리핑 요청이 시간 초과되었습니다.");
+        setBriefingState("idle");
+        return;
+      }
+      if (res.type === "briefing_error") {
+        const reason = res.reason ?? "error";
+        const known = reasonMessages[reason];
+        setBanner(known ?? `브리핑 실패: ${reason}`);
+        setBriefingState("idle");
+        return;
+      }
+      setBanner(null);
+      setBriefingState("playing");
+      try {
+        await playBase64Audio(res.audio, res.mime || "audio/mpeg");
+      } catch {
+        setBanner("음성 재생에 실패했습니다.");
+      } finally {
+        setBriefingState("idle");
+      }
+    } catch {
+      setBanner("브리핑 처리 중 오류가 발생했습니다.");
+      setBriefingState("idle");
     }
-    speakText(text.slice(0, 4000));
-  }, [extractLastAssistantText, requestTranscriptBriefing, speakText]);
+  }, [briefingState, playBase64Audio, requestBriefing, stopBriefingAudio]);
 
   useEffect(() => {
     return () => {
-      if (typeof window !== "undefined" && "speechSynthesis" in window) {
-        window.speechSynthesis.cancel();
-      }
+      stopBriefingAudio();
       const pending = briefingPendingRef.current;
       if (pending) {
         clearTimeout(pending.timer);
         briefingPendingRef.current = null;
       }
     };
-  }, []);
+  }, [stopBriefingAudio]);
 
   const focusIfKeyboardLikelyVisible = useCallback(() => {
     // On mobile, calling term.focus() steals focus to xterm's hidden
@@ -734,10 +747,22 @@ export function Terminal({ name }: Props) {
         <span className="spacer" />
         <button
           onClick={toggleBriefing}
-          title={speaking ? "음성 정지" : "마지막 답변 음성 브리핑"}
-          aria-pressed={speaking}
+          disabled={briefingState === "loading"}
+          aria-busy={briefingState === "loading"}
+          aria-pressed={briefingState === "playing"}
+          title={
+            briefingState === "playing"
+              ? "음성 정지"
+              : briefingState === "loading"
+                ? "Claude 브리핑 준비 중…"
+                : "Claude에게 대화 브리핑을 요청하고 음성으로 들려줍니다"
+          }
         >
-          {speaking ? "⏹ 정지" : "🔊 브리핑"}
+          {briefingState === "playing"
+            ? "⏹ 정지"
+            : briefingState === "loading"
+              ? "⏳ 브리핑…"
+              : "🔊 브리핑"}
         </button>
         <button
           onClick={toggleClaude}

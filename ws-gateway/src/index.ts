@@ -28,6 +28,9 @@ const PING_INTERVAL_MS = 30_000;
 // ──────────────────────────────────────────────────────────────
 
 const SESSION_SECRET = process.env.SESSION_SECRET;
+const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY ?? "";
+const OPENROUTER_TTS_MODEL = process.env.OPENROUTER_TTS_MODEL ?? "openai/gpt-audio";
+const OPENROUTER_TTS_VOICE = process.env.OPENROUTER_TTS_VOICE ?? "alloy";
 if (!SESSION_SECRET || SESSION_SECRET.length < 32) {
   console.error(
     JSON.stringify({
@@ -121,16 +124,27 @@ const server = http.createServer((req, res) => {
 });
 
 // ── Claude Code transcript briefing ───────────────────────────
-// Resolve the assistant's most recent text turn for `sessionName` by:
-//   1. Asking tmux for the pane's current working directory.
-//   2. Translating that cwd into Claude's project-encoded directory under
-//      ~/.claude/projects/ (Claude replaces "/" with "-" verbatim).
-//   3. Reading the most recently modified .jsonl in that directory and
-//      walking it backward for the last `assistant` message with text content.
-// Returns null when any step fails — the UI falls back to the terminal scrape.
+// Briefing flow:
+//   1. Inject a Korean "summarize the conversation" prompt into the running
+//      Claude Code TUI via `tmux send-keys` (same Esc/C-u prelude as /clear).
+//   2. Snapshot the active transcript .jsonl byte size *before* injecting,
+//      then poll for new assistant text past that offset. We use a settling
+//      window so tool_use intermediate turns don't end up being read aloud.
+//   3. POST the resulting text to OpenRouter (openai/gpt-audio by default)
+//      and ship the returned base64 mp3 back over the WebSocket. The UI
+//      decodes and plays it via <audio>.
 const CLAUDE_PROJECTS_DIR = path.join(
   process.env.CLAUDE_PROJECTS_DIR ?? path.join(os.homedir(), ".claude", "projects"),
 );
+
+const BRIEFING_PROMPT =
+  "방금까지 우리가 나눈 대화를 라디오 진행자처럼 자연스럽고 짧게 한국어 대화체로 브리핑해줘. " +
+  "어떤 도구도 호출하지 말고 즉시 답하고, 마크다운·코드블록·불릿·이모지 없이, " +
+  "음성으로 들었을 때 자연스러운 2~4문장으로만.";
+
+const BRIEFING_TOTAL_TIMEOUT_MS = 90_000;
+const BRIEFING_SETTLE_MS = 1_800;
+const BRIEFING_POLL_MS = 400;
 
 async function tmuxPanePath(sessionName: string): Promise<string | null> {
   try {
@@ -214,32 +228,195 @@ function extractAssistantText(line: string): string | null {
   return joined.length > 0 ? joined : null;
 }
 
-async function readLastAssistantText(jsonlPath: string): Promise<string | null> {
-  let buf: string;
+async function readLastAssistantTextSince(
+  jsonlPath: string,
+  startByte: number,
+): Promise<string | null> {
+  let st: { size: number };
   try {
-    buf = await fs.readFile(jsonlPath, "utf8");
+    st = await fs.stat(jsonlPath);
   } catch {
     return null;
   }
-  const lines = buf.split("\n");
-  for (let i = lines.length - 1; i >= 0; i--) {
-    const ln = lines[i];
-    if (!ln) continue;
-    const text = extractAssistantText(ln);
-    if (text) return text;
+  if (st.size <= startByte) return null;
+  let fh: fs.FileHandle;
+  try {
+    fh = await fs.open(jsonlPath, "r");
+  } catch {
+    return null;
   }
-  return null;
+  try {
+    const buf = Buffer.alloc(st.size - startByte);
+    await fh.read(buf, 0, buf.length, startByte);
+    const text = buf.toString("utf8");
+    const lines = text.split("\n");
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const ln = lines[i];
+      if (!ln) continue;
+      const t = extractAssistantText(ln);
+      if (t) return t;
+    }
+    return null;
+  } finally {
+    try {
+      await fh.close();
+    } catch {
+      /* ignore */
+    }
+  }
 }
 
-async function getBriefingText(sessionName: string): Promise<{ text: string | null; reason?: string }> {
+async function statSize(p: string): Promise<number> {
+  try {
+    const st = await fs.stat(p);
+    return st.size;
+  } catch {
+    return 0;
+  }
+}
+
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+async function tmuxSendKeys(sessionName: string, ...keys: string[]): Promise<void> {
+  await execFileP("tmux", ["send-keys", "-t", sessionName, ...keys]);
+}
+
+async function tmuxPaneCommand(sessionName: string): Promise<string | null> {
+  try {
+    const { stdout } = await execFileP("tmux", [
+      "display-message",
+      "-p",
+      "-t",
+      sessionName,
+      "#{pane_current_command}",
+    ]);
+    const cmd = stdout.trim();
+    return cmd.length > 0 ? cmd : null;
+  } catch {
+    return null;
+  }
+}
+
+// Inject a fresh prompt into the Claude TUI. Mirrors the /clear path in the
+// UI's claude API route — Esc cancels any in-flight stream / clears partial
+// input, C-u drains the readline buffer, then a short pause lets the input
+// box re-render before we type.
+async function injectBriefingPrompt(sessionName: string): Promise<void> {
+  await tmuxSendKeys(sessionName, "Escape");
+  await tmuxSendKeys(sessionName, "C-u");
+  await sleep(150);
+  await tmuxSendKeys(sessionName, BRIEFING_PROMPT, "Enter");
+}
+
+async function waitForBriefingResponse(
+  jsonlPath: string,
+  startByte: number,
+): Promise<string | null> {
+  const deadline = Date.now() + BRIEFING_TOTAL_TIMEOUT_MS;
+  let lastText: string | null = null;
+  let lastSeenAt = Date.now();
+  while (Date.now() < deadline) {
+    const text = await readLastAssistantTextSince(jsonlPath, startByte);
+    if (text && text !== lastText) {
+      lastText = text;
+      lastSeenAt = Date.now();
+    }
+    if (lastText && Date.now() - lastSeenAt >= BRIEFING_SETTLE_MS) {
+      return lastText;
+    }
+    await sleep(BRIEFING_POLL_MS);
+  }
+  return lastText;
+}
+
+interface BriefingAudio {
+  audio: string; // base64
+  mime: string;
+  text: string;
+}
+
+async function synthesizeViaOpenRouter(text: string): Promise<BriefingAudio> {
+  if (!OPENROUTER_API_KEY) {
+    throw new Error("OPENROUTER_API_KEY not configured");
+  }
+  const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: OPENROUTER_TTS_MODEL,
+      modalities: ["text", "audio"],
+      audio: { voice: OPENROUTER_TTS_VOICE, format: "mp3" },
+      messages: [
+        {
+          role: "system",
+          content:
+            "You speak the user's text aloud verbatim in a natural, conversational Korean broadcast tone. Do not paraphrase, summarize, translate, comment, or add anything — read it as-is.",
+        },
+        { role: "user", content: text },
+      ],
+    }),
+  });
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw new Error(`openrouter ${res.status}: ${body.slice(0, 300)}`);
+  }
+  const json = (await res.json()) as {
+    choices?: Array<{ message?: { audio?: { data?: string; format?: string } } }>;
+  };
+  const audio = json.choices?.[0]?.message?.audio;
+  if (!audio?.data) {
+    throw new Error("openrouter response missing audio.data");
+  }
+  const fmt = audio.format ?? "mp3";
+  const mime = fmt === "wav" ? "audio/wav" : fmt === "opus" ? "audio/ogg" : "audio/mpeg";
+  return { audio: audio.data, mime, text };
+}
+
+interface BriefingResult {
+  ok: boolean;
+  reason?: string;
+  text?: string;
+  audio?: string;
+  mime?: string;
+}
+
+async function runBriefing(sessionName: string): Promise<BriefingResult> {
   const cwd = await tmuxPanePath(sessionName);
-  if (!cwd) return { text: null, reason: "no_pane_path" };
+  if (!cwd) return { ok: false, reason: "no_pane_path" };
   const projectDir = path.join(CLAUDE_PROJECTS_DIR, encodeProjectDir(cwd));
   const jsonl = await findLatestJsonl(projectDir);
-  if (!jsonl) return { text: null, reason: "no_transcript" };
-  const text = await readLastAssistantText(jsonl);
-  if (!text) return { text: null, reason: "no_assistant_text" };
-  return { text };
+  if (!jsonl) return { ok: false, reason: "no_transcript" };
+
+  const paneCmd = (await tmuxPaneCommand(sessionName))?.toLowerCase() ?? "";
+  if (!paneCmd.includes("claude") && !paneCmd.includes("node")) {
+    // Pane is in a shell — typing the prompt would just clutter the terminal
+    // without actually reaching Claude.
+    return { ok: false, reason: "claude_not_running" };
+  }
+
+  if (!OPENROUTER_API_KEY) {
+    return { ok: false, reason: "no_api_key" };
+  }
+
+  const startByte = await statSize(jsonl);
+  try {
+    await injectBriefingPrompt(sessionName);
+  } catch (err) {
+    return { ok: false, reason: `tmux_send_failed:${(err as Error).message}` };
+  }
+
+  const text = await waitForBriefingResponse(jsonl, startByte);
+  if (!text) return { ok: false, reason: "no_assistant_text" };
+
+  try {
+    const audio = await synthesizeViaOpenRouter(text);
+    return { ok: true, text: audio.text, audio: audio.audio, mime: audio.mime };
+  } catch (err) {
+    return { ok: false, reason: `tts_failed:${(err as Error).message}`, text };
+  }
 }
 // ──────────────────────────────────────────────────────────────
 
@@ -376,17 +553,29 @@ wss.on("connection", (ws: WebSocket, req: http.IncomingMessage, sessionName: str
       }
       if (msg.type === "briefing") {
         const reqId = (msg as { id?: string }).id;
-        void getBriefingText(sessionName)
+        void runBriefing(sessionName)
           .then((res) => {
             if (ws.readyState !== ws.OPEN) return;
-            ws.send(
-              JSON.stringify({
-                type: "briefing",
-                id: reqId,
-                text: res.text,
-                reason: res.reason,
-              }),
-            );
+            if (res.ok) {
+              ws.send(
+                JSON.stringify({
+                  type: "briefing_audio",
+                  id: reqId,
+                  audio: res.audio,
+                  mime: res.mime,
+                  text: res.text,
+                }),
+              );
+            } else {
+              ws.send(
+                JSON.stringify({
+                  type: "briefing_error",
+                  id: reqId,
+                  reason: res.reason,
+                  text: res.text,
+                }),
+              );
+            }
           })
           .catch((err) => {
             log("warn", "ws.briefing.error", {
@@ -397,9 +586,8 @@ wss.on("connection", (ws: WebSocket, req: http.IncomingMessage, sessionName: str
             if (ws.readyState === ws.OPEN) {
               ws.send(
                 JSON.stringify({
-                  type: "briefing",
+                  type: "briefing_error",
                   id: reqId,
-                  text: null,
                   reason: "error",
                 }),
               );

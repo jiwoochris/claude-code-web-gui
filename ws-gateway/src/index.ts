@@ -390,10 +390,18 @@ async function runBriefing(sessionName: string): Promise<BriefingResult> {
   const jsonl = await findLatestJsonl(projectDir);
   if (!jsonl) return { ok: false, reason: "no_transcript" };
 
-  const paneCmd = (await tmuxPaneCommand(sessionName))?.toLowerCase() ?? "";
-  if (!paneCmd.includes("claude") && !paneCmd.includes("node")) {
-    // Pane is in a shell — typing the prompt would just clutter the terminal
-    // without actually reaching Claude.
+  // tmux's `pane_current_command` reports the *name* of the foreground proc,
+  // which on macOS comes from p_comm. Claude Code sets its proc name to its
+  // version string (e.g. "2.1.133"), so we cannot match on "claude"/"node"
+  // directly. Mirror the UI's isShellCommand logic instead — if the pane is
+  // running anything other than a known shell, we assume Claude is up.
+  const SHELL_NAMES = new Set([
+    "bash", "zsh", "sh", "fish", "dash", "ash", "ksh", "tcsh", "csh",
+    "nu", "pwsh", "powershell",
+  ]);
+  const rawPaneCmd = (await tmuxPaneCommand(sessionName)) ?? "";
+  const paneCmd = rawPaneCmd.replace(/^-/, "").toLowerCase();
+  if (paneCmd === "" || SHELL_NAMES.has(paneCmd)) {
     return { ok: false, reason: "claude_not_running" };
   }
 

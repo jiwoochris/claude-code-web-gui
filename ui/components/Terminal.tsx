@@ -115,6 +115,16 @@ export function Terminal({ name }: Props) {
       }, 30_000);
     };
 
+    // TEMP DIAGNOSTIC — log raw payloads that carry the markdown link or
+    // an OSC 8 hyperlink so we can tell exactly what Claude Code is
+    // emitting on the wire. Logged via JSON.stringify so escape sequences
+    // (e.g. ESC ] 8 ; ; URL ESC \) are visible.
+    const diagPeek = (label: string, decoded: string) => {
+      if (decoded.includes("캘린더") || decoded.includes("\x1b]8")) {
+        console.log(`[ws raw ${label}]`, JSON.stringify(decoded).slice(0, 800));
+      }
+    };
+
     ws.onmessage = (ev) => {
       const t = termRef.current;
       if (!t) return;
@@ -144,13 +154,28 @@ export function Terminal({ name }: Props) {
           }
         }
         lastTermDataAtRef.current = Date.now();
+        diagPeek("str", ev.data);
         t.write(ev.data);
       } else if (ev.data instanceof ArrayBuffer) {
         lastTermDataAtRef.current = Date.now();
-        t.write(new Uint8Array(ev.data));
+        const u8 = new Uint8Array(ev.data);
+        try {
+          diagPeek("bin", new TextDecoder().decode(u8));
+        } catch {
+          /* ignore decode failures — diagnostic only */
+        }
+        t.write(u8);
       } else if (ev.data instanceof Blob) {
         lastTermDataAtRef.current = Date.now();
-        ev.data.arrayBuffer().then((buf) => t.write(new Uint8Array(buf)));
+        ev.data.arrayBuffer().then((buf) => {
+          const u8 = new Uint8Array(buf);
+          try {
+            diagPeek("blob", new TextDecoder().decode(u8));
+          } catch {
+            /* ignore decode failures — diagnostic only */
+          }
+          t.write(u8);
+        });
       }
     };
 

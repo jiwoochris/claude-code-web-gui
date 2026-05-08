@@ -73,12 +73,37 @@ export function PdfCanvasViewer({ src, notes }: Props) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const noteNodesRef = useRef<HTMLDivElement[]>([]);
   const slotsRef = useRef<HTMLDivElement[]>([]);
+  const jumpInputRef = useRef<HTMLInputElement>(null);
   const [status, setStatus] = useState<"loading" | "ready" | "error">(
     "loading",
   );
   const [error, setError] = useState<string | null>(null);
   const [pageCount, setPageCount] = useState(0);
   const [currentPage, setCurrentPage] = useState(1);
+  const [jumpEditing, setJumpEditing] = useState(false);
+  const [jumpValue, setJumpValue] = useState("");
+
+  function jumpToPage(target: number) {
+    if (!Number.isFinite(target)) return;
+    const clamped = Math.min(Math.max(Math.round(target), 1), pageCount || 1);
+    const slot = slotsRef.current[clamped - 1];
+    if (!slot) return;
+    slot.scrollIntoView({ behavior: "smooth", block: "start" });
+    setCurrentPage(clamped);
+  }
+
+  function commitJump() {
+    const n = parseInt(jumpValue, 10);
+    if (Number.isFinite(n)) jumpToPage(n);
+    setJumpEditing(false);
+  }
+
+  useEffect(() => {
+    if (jumpEditing) {
+      jumpInputRef.current?.focus();
+      jumpInputRef.current?.select();
+    }
+  }, [jumpEditing]);
 
   // Track which slide is most visible inside the scroll container so the
   // page indicator can mirror "page X of Y" without controlling scroll.
@@ -271,9 +296,48 @@ export function PdfCanvasViewer({ src, notes }: Props) {
         />
       </div>
       {status === "ready" && pageCount > 0 ? (
-        <div className="fv-pdf-pageind">
-          {currentPage} / {pageCount}
-        </div>
+        jumpEditing ? (
+          <form
+            className="fv-pdf-pageind editing"
+            onSubmit={(e) => {
+              e.preventDefault();
+              commitJump();
+            }}
+          >
+            <input
+              ref={jumpInputRef}
+              className="fv-pdf-pageind-input"
+              type="number"
+              inputMode="numeric"
+              min={1}
+              max={pageCount}
+              value={jumpValue}
+              onChange={(e) => setJumpValue(e.target.value)}
+              onBlur={commitJump}
+              onKeyDown={(e) => {
+                if (e.key === "Escape") {
+                  e.preventDefault();
+                  setJumpEditing(false);
+                }
+              }}
+              aria-label={`페이지 이동 (1-${pageCount})`}
+            />
+            <span> / {pageCount}</span>
+          </form>
+        ) : (
+          <button
+            type="button"
+            className="fv-pdf-pageind"
+            onClick={() => {
+              setJumpValue(String(currentPage));
+              setJumpEditing(true);
+            }}
+            aria-label={`현재 페이지 ${currentPage} / ${pageCount}, 클릭하여 페이지 이동`}
+            title="클릭하여 페이지 이동"
+          >
+            {currentPage} / {pageCount}
+          </button>
+        )
       ) : null}
     </div>
   );

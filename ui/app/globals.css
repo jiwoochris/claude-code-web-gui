@@ -1259,13 +1259,47 @@ body.col-resizing * {
   bottom: 14px;
   background: rgba(0, 0, 0, 0.62);
   color: #fff;
+  font: inherit;
   font-variant-numeric: tabular-nums;
   font-size: 12px;
   padding: 4px 10px;
+  border: none;
   border-radius: 999px;
-  pointer-events: none;
+  cursor: pointer;
   z-index: 2;
   box-shadow: 0 1px 4px rgba(0, 0, 0, 0.35);
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.fv-pdf-pageind:hover {
+  background: rgba(0, 0, 0, 0.78);
+}
+
+.fv-pdf-pageind.editing {
+  cursor: text;
+}
+
+.fv-pdf-pageind-input {
+  width: 3ch;
+  min-width: 24px;
+  padding: 0 2px;
+  background: transparent;
+  border: none;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.6);
+  color: #fff;
+  font: inherit;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  outline: none;
+  -moz-appearance: textfield;
+}
+
+.fv-pdf-pageind-input::-webkit-outer-spin-button,
+.fv-pdf-pageind-input::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
 }
 
 .fv-pdf-pages {

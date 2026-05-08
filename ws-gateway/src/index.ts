@@ -140,7 +140,7 @@ const server = http.createServer((req, res) => {
 // as a textual anchor when scraping the response out of the xterm buffer —
 // shorter and more recognizable means the anchor scan is more reliable.
 const BRIEFING_SIDE_COMMAND = "/btw";
-const BRIEFING_PROMPT = "방금까지 진행한 너의 마지막 작업 및 대화를 정리해줘.";
+const BRIEFING_PROMPT = "넌 내 비서야. 내 마지막 요청과 너의 작업 및 대화를 말하듯이 정리해줘.";
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 

@@ -16,16 +16,16 @@ interface Props {
 }
 
 // pdf.js 5.x calls Uint8Array.prototype.toHex/setFromHex (TC39 Uint8Array
-// base16 methods). iOS Safari < 18.2 and older Chromes don't ship them yet,
-// so installing a tiny polyfill on first load lets pdf.js run on those
-// browsers.
-function polyfillUint8ArrayBase16(): void {
-  const proto = Uint8Array.prototype as Uint8Array & {
+// base16 methods) and Map.prototype.getOrInsertComputed (TC39 upsert
+// proposal). iOS Safari < 18.4 and older Chromes don't ship these yet, so
+// installing tiny polyfills on first load lets pdf.js run on those browsers.
+function polyfillForPdfJs(): void {
+  const u8 = Uint8Array.prototype as Uint8Array & {
     toHex?: () => string;
     setFromHex?: (hex: string) => { read: number; written: number };
   };
-  if (typeof proto.toHex !== "function") {
-    Object.defineProperty(proto, "toHex", {
+  if (typeof u8.toHex !== "function") {
+    Object.defineProperty(u8, "toHex", {
       value: function toHex(this: Uint8Array): string {
         let out = "";
         for (let i = 0; i < this.length; i++) {
@@ -37,8 +37,8 @@ function polyfillUint8ArrayBase16(): void {
       writable: true,
     });
   }
-  if (typeof proto.setFromHex !== "function") {
-    Object.defineProperty(proto, "setFromHex", {
+  if (typeof u8.setFromHex !== "function") {
+    Object.defineProperty(u8, "setFromHex", {
       value: function setFromHex(this: Uint8Array, hex: string) {
         const clean = hex.length % 2 === 0 ? hex : hex.slice(0, hex.length - 1);
         const max = Math.min(clean.length / 2, this.length);
@@ -55,6 +55,53 @@ function polyfillUint8ArrayBase16(): void {
       writable: true,
     });
   }
+  const mapProto = Map.prototype as Map<unknown, unknown> & {
+    getOrInsertComputed?: <K, V>(key: K, cb: (key: K) => V) => V;
+  };
+  if (typeof mapProto.getOrInsertComputed !== "function") {
+    Object.defineProperty(mapProto, "getOrInsertComputed", {
+      value: function getOrInsertComputed<K, V>(
+        this: Map<K, V>,
+        key: K,
+        callbackfn: (key: K) => V,
+      ): V {
+        if (typeof callbackfn !== "function") {
+          throw new TypeError("callbackfn must be a function");
+        }
+        if (this.has(key)) return this.get(key) as V;
+        const value = callbackfn(key);
+        this.set(key, value);
+        return value;
+      },
+      configurable: true,
+      writable: true,
+    });
+  }
+  const wmProto = WeakMap.prototype as WeakMap<object, unknown> & {
+    getOrInsertComputed?: <K extends object, V>(
+      key: K,
+      cb: (key: K) => V,
+    ) => V;
+  };
+  if (typeof wmProto.getOrInsertComputed !== "function") {
+    Object.defineProperty(wmProto, "getOrInsertComputed", {
+      value: function getOrInsertComputed<K extends object, V>(
+        this: WeakMap<K, V>,
+        key: K,
+        callbackfn: (key: K) => V,
+      ): V {
+        if (typeof callbackfn !== "function") {
+          throw new TypeError("callbackfn must be a function");
+        }
+        if (this.has(key)) return this.get(key) as V;
+        const value = callbackfn(key);
+        this.set(key, value);
+        return value;
+      },
+      configurable: true,
+      writable: true,
+    });
+  }
 }
 
 // Lazy ESM import so the bundle stays out of the initial chunk and Node-only
@@ -62,9 +109,9 @@ function polyfillUint8ArrayBase16(): void {
 // a static file under /public/pdfjs/ (see scripts.copy-pdf-worker) so the
 // browser fetches it from the same origin without bundler-specific imports.
 async function loadPdfJs(): Promise<typeof import("pdfjs-dist")> {
-  polyfillUint8ArrayBase16();
+  polyfillForPdfJs();
   const pdfjs = await import("pdfjs-dist");
-  pdfjs.GlobalWorkerOptions.workerSrc = "/pdfjs/pdf.worker.min.mjs?v=polyfill1";
+  pdfjs.GlobalWorkerOptions.workerSrc = "/pdfjs/pdf.worker.min.mjs?v=polyfill2";
   return pdfjs;
 }
 

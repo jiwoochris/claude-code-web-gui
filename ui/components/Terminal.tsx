@@ -46,16 +46,22 @@ export function Terminal({ name }: Props) {
     "idle",
   );
   const [claudeBusy, setClaudeBusy] = useState(false);
-  type BriefingResponse =
-    | { type: "briefing_audio"; audio: string; mime: string; text?: string }
-    | { type: "briefing_error"; reason?: string; text?: string };
+  type BriefingMsg =
+    | { type: "briefing_inject_ok" }
+    | { type: "briefing_audio"; audio: string; mime: string }
+    | { type: "briefing_error"; reason?: string };
   const briefingPendingRef = useRef<{
     id: string;
-    resolve: (msg: BriefingResponse | null) => void;
+    resolve: (msg: BriefingMsg | null) => void;
     timer: ReturnType<typeof setTimeout>;
   } | null>(null);
   const briefingAudioRef = useRef<HTMLAudioElement | null>(null);
   const briefingAudioUrlRef = useRef<string | null>(null);
+  // Timestamp of the last pty payload we forwarded to xterm. Set by
+  // ws.onmessage for every chunk. The briefing flow uses this as a
+  // settling signal — once the pane has been quiet for ~2s after the
+  // /btw injection, we assume the side answer has finished rendering.
+  const lastTermDataAtRef = useRef<number>(0);
 
   const sendResize = useCallback(() => {
     const ws = wsRef.current;
@@ -120,12 +126,16 @@ export function Terminal({ name }: Props) {
           try {
             const msg = JSON.parse(ev.data);
             if (msg?.type === "ping" || msg?.type === "pong") return;
-            if (msg?.type === "briefing_audio" || msg?.type === "briefing_error") {
+            if (
+              msg?.type === "briefing_inject_ok" ||
+              msg?.type === "briefing_audio" ||
+              msg?.type === "briefing_error"
+            ) {
               const pending = briefingPendingRef.current;
               if (pending && (!msg.id || msg.id === pending.id)) {
                 clearTimeout(pending.timer);
                 briefingPendingRef.current = null;
-                pending.resolve(msg as BriefingResponse);
+                pending.resolve(msg as BriefingMsg);
               }
               return;
             }
@@ -133,10 +143,13 @@ export function Terminal({ name }: Props) {
             /* fall through and write as raw text */
           }
         }
+        lastTermDataAtRef.current = Date.now();
         t.write(ev.data);
       } else if (ev.data instanceof ArrayBuffer) {
+        lastTermDataAtRef.current = Date.now();
         t.write(new Uint8Array(ev.data));
       } else if (ev.data instanceof Blob) {
+        lastTermDataAtRef.current = Date.now();
         ev.data.arrayBuffer().then((buf) => t.write(new Uint8Array(buf)));
       }
     };
@@ -641,37 +654,127 @@ export function Terminal({ name }: Props) {
     }
   }, []);
 
-  const requestBriefing = useCallback((): Promise<BriefingResponse | null> => {
-    const ws = wsRef.current;
-    if (!ws || ws.readyState !== WebSocket.OPEN) return Promise.resolve(null);
-    const prev = briefingPendingRef.current;
-    if (prev) {
-      clearTimeout(prev.timer);
-      prev.resolve(null);
-      briefingPendingRef.current = null;
-    }
-    return new Promise<BriefingResponse | null>((resolve) => {
-      const id =
-        (typeof crypto !== "undefined" && "randomUUID" in crypto
-          ? crypto.randomUUID()
-          : Math.random().toString(36).slice(2));
-      // Total budget = Claude reply + OpenRouter synth + slack. ws-gateway's
-      // own deadline is 90s; we add ~30s for the TTS round-trip.
-      const timer = setTimeout(() => {
-        if (briefingPendingRef.current?.id === id) {
+  // Single in-flight briefing slot. Replacing the pending entry rejects the
+  // previous one so we never hang multiple resolvers.
+  const sendBriefingRequest = useCallback(
+    (payload: { type: "briefing_inject" | "briefing_synth"; text?: string }, timeoutMs: number) => {
+      const ws = wsRef.current;
+      if (!ws || ws.readyState !== WebSocket.OPEN) return Promise.resolve(null);
+      const prev = briefingPendingRef.current;
+      if (prev) {
+        clearTimeout(prev.timer);
+        prev.resolve(null);
+        briefingPendingRef.current = null;
+      }
+      return new Promise<BriefingMsg | null>((resolve) => {
+        const id =
+          typeof crypto !== "undefined" && "randomUUID" in crypto
+            ? crypto.randomUUID()
+            : Math.random().toString(36).slice(2);
+        const timer = setTimeout(() => {
+          if (briefingPendingRef.current?.id === id) {
+            briefingPendingRef.current = null;
+            resolve(null);
+          }
+        }, timeoutMs);
+        briefingPendingRef.current = { id, resolve, timer };
+        try {
+          ws.send(JSON.stringify({ ...payload, id }));
+        } catch {
+          clearTimeout(timer);
           briefingPendingRef.current = null;
           resolve(null);
         }
-      }, 120_000);
-      briefingPendingRef.current = { id, resolve, timer };
-      try {
-        ws.send(JSON.stringify({ type: "briefing", id }));
-      } catch {
-        clearTimeout(timer);
-        briefingPendingRef.current = null;
-        resolve(null);
+      });
+    },
+    [],
+  );
+
+  // Wait until xterm hasn't received any new pty bytes for `quietMs`. Caller
+  // passes `since` (timestamp captured *after* the inject ack) so we don't
+  // mistake pre-injection idleness for the response settling.
+  const waitForTerminalSettle = useCallback(
+    (since: number, quietMs: number, maxMs: number): Promise<boolean> => {
+      return new Promise((resolve) => {
+        const startedAt = Date.now();
+        const tick = () => {
+          const now = Date.now();
+          if (now - startedAt > maxMs) {
+            // Timed out without observing a quiet stretch. The buffer may
+            // still hold a usable response, so we report timeout=false and
+            // let the caller decide whether to scrape anyway.
+            resolve(false);
+            return;
+          }
+          const last = lastTermDataAtRef.current;
+          // Settled only if (a) we've seen at least one byte after the
+          // inject and (b) it's been quiet for the full quietMs.
+          if (last >= since && now - last >= quietMs) {
+            resolve(true);
+            return;
+          }
+          setTimeout(tick, 200);
+        };
+        tick();
+      });
+    },
+    [],
+  );
+
+  // Pull the most recent assistant text out of the xterm scrollback. Strips
+  // Claude TUI box drawing (╭─╮ │>│ ╰─╯) and the status footer; returns the
+  // contiguous run of plain lines just above the input box.
+  const extractLastAssistantText = useCallback((): string => {
+    const term = termRef.current;
+    if (!term) return "";
+    const buf = term.buffer.active;
+    const raw: string[] = [];
+    for (let i = 0; i < buf.length; i++) {
+      const line = buf.getLine(i);
+      raw.push(line ? line.translateToString(true) : "");
+    }
+
+    const BOX_CHARS_G = /[│┃╭╮╰╯─━└┘┌┐╔╗╚╝║═┏┓┗┛┃]/g;
+    const BOX_TOP_CHARS = /[╭┌╔┏]/;
+    const isBoxOrEmpty = (s: string) => {
+      const t = s.trim();
+      if (t === "") return true;
+      const stripped = t.replace(BOX_CHARS_G, "").trim();
+      return stripped === "" || /^[╭╮╰╯┌┐└┘┏┓┗┛]/.test(t);
+    };
+
+    let boxTop = -1;
+    for (let i = raw.length - 1; i >= 0; i--) {
+      if (BOX_TOP_CHARS.test(raw[i])) {
+        boxTop = i;
+        break;
       }
-    });
+    }
+
+    let end = boxTop >= 0 ? boxTop : raw.length;
+    while (end > 0 && isBoxOrEmpty(raw[end - 1])) end--;
+
+    let start = end;
+    for (let i = end - 1; i >= 0; i--) {
+      if (isBoxOrEmpty(raw[i])) {
+        start = i + 1;
+        break;
+      }
+      const t = raw[i].replace(BOX_CHARS_G, "").trim();
+      if (/^>\s/.test(t)) {
+        start = i + 1;
+        break;
+      }
+      start = i;
+    }
+
+    const cleaned = raw
+      .slice(start, end)
+      .map((l) => l.replace(BOX_CHARS_G, "").replace(/^\s+|\s+$/g, ""))
+      .filter((l) => l !== "")
+      .join(" ");
+
+    return cleaned.slice(0, 2000);
   }, []);
 
   const playBase64Audio = useCallback(
@@ -744,42 +847,85 @@ export function Terminal({ name }: Props) {
     }
 
     setBriefingState("loading");
-    setBanner("Claude가 브리핑을 준비 중입니다…");
+    setBanner("Claude에게 /btw 브리핑을 요청하는 중…");
     const reasonMessages: Record<string, string> = {
-      no_pane_path: "세션 작업 디렉터리를 찾지 못했습니다.",
-      no_transcript: "Claude 대화 기록을 찾지 못했습니다.",
       claude_not_running: "이 세션에서 Claude Code가 실행 중이 아닙니다.",
       no_api_key: "OPENROUTER_API_KEY가 설정되어 있지 않습니다.",
-      no_assistant_text: "Claude의 브리핑 응답을 시간 내에 받지 못했습니다.",
+      empty_text: "브리핑 응답을 추출하지 못했습니다.",
     };
+
+    // Phase 1: ask the gateway to inject `/btw <prompt>` into the TUI.
+    const injectAt = Date.now();
+    const inject = await sendBriefingRequest({ type: "briefing_inject" }, 15_000);
+    if (!inject) {
+      setBanner("브리핑 요청이 시간 초과되었습니다.");
+      setBriefingState("idle");
+      return;
+    }
+    if (inject.type === "briefing_error") {
+      const reason = inject.reason ?? "error";
+      setBanner(reasonMessages[reason] ?? `브리핑 실패: ${reason}`);
+      setBriefingState("idle");
+      return;
+    }
+    if (inject.type !== "briefing_inject_ok") {
+      setBanner("예상치 못한 응답을 받았습니다.");
+      setBriefingState("idle");
+      return;
+    }
+
+    // Phase 2: wait for the TUI to render and settle, then scrape the
+    // visible answer out of the xterm buffer. /btw doesn't write to
+    // ~/.claude/projects/*.jsonl, so the buffer is the only source of truth.
+    setBanner("Claude의 답변을 기다리는 중…");
+    await waitForTerminalSettle(injectAt, 2_000, 60_000);
+    const scraped = extractLastAssistantText();
+    if (!scraped) {
+      setBanner("브리핑 응답을 화면에서 찾지 못했습니다.");
+      setBriefingState("idle");
+      return;
+    }
+
+    // Phase 3: synthesize via OpenRouter on the gateway.
+    setBanner("음성 합성 중…");
+    const synth = await sendBriefingRequest(
+      { type: "briefing_synth", text: scraped },
+      120_000,
+    );
+    if (!synth) {
+      setBanner("음성 합성이 시간 초과되었습니다.");
+      setBriefingState("idle");
+      return;
+    }
+    if (synth.type === "briefing_error") {
+      const reason = synth.reason ?? "error";
+      setBanner(reasonMessages[reason] ?? `음성 합성 실패: ${reason}`);
+      setBriefingState("idle");
+      return;
+    }
+    if (synth.type !== "briefing_audio") {
+      setBanner("예상치 못한 응답을 받았습니다.");
+      setBriefingState("idle");
+      return;
+    }
+
+    setBanner(null);
+    setBriefingState("playing");
     try {
-      const res = await requestBriefing();
-      if (!res) {
-        setBanner("브리핑 요청이 시간 초과되었습니다.");
-        setBriefingState("idle");
-        return;
-      }
-      if (res.type === "briefing_error") {
-        const reason = res.reason ?? "error";
-        const known = reasonMessages[reason];
-        setBanner(known ?? `브리핑 실패: ${reason}`);
-        setBriefingState("idle");
-        return;
-      }
-      setBanner(null);
-      setBriefingState("playing");
-      try {
-        await playBase64Audio(res.audio, res.mime || "audio/mpeg");
-      } catch {
-        setBanner("음성 재생에 실패했습니다.");
-      } finally {
-        setBriefingState("idle");
-      }
+      await playBase64Audio(synth.audio, synth.mime || "audio/wav");
     } catch {
-      setBanner("브리핑 처리 중 오류가 발생했습니다.");
+      setBanner("음성 재생에 실패했습니다.");
+    } finally {
       setBriefingState("idle");
     }
-  }, [briefingState, playBase64Audio, requestBriefing, stopBriefingAudio]);
+  }, [
+    briefingState,
+    extractLastAssistantText,
+    playBase64Audio,
+    sendBriefingRequest,
+    stopBriefingAudio,
+    waitForTerminalSettle,
+  ]);
 
   useEffect(() => {
     return () => {

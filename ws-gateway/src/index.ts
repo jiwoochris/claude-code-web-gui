@@ -1,8 +1,5 @@
 import http from "node:http";
 import { execFile } from "node:child_process";
-import fs from "node:fs/promises";
-import os from "node:os";
-import path from "node:path";
 import { promisify } from "node:util";
 import { WebSocketServer, type WebSocket } from "ws";
 import * as pty from "node-pty";
@@ -123,226 +120,25 @@ const server = http.createServer((req, res) => {
   res.end("Not Found");
 });
 
-// ── Claude Code transcript briefing ───────────────────────────
-// Briefing flow:
-//   1. Inject a Korean "summarize the conversation" prompt into the running
-//      Claude Code TUI via `tmux send-keys` (same Esc/C-u prelude as /clear).
-//   2. Snapshot the active transcript .jsonl byte size *before* injecting,
-//      then poll for new assistant text past that offset. We use a settling
-//      window so tool_use intermediate turns don't end up being read aloud.
-//   3. POST the resulting text to OpenRouter (openai/gpt-audio by default)
-//      and ship the returned base64 mp3 back over the WebSocket. The UI
-//      decodes and plays it via <audio>.
-const CLAUDE_PROJECTS_DIR = path.join(
-  process.env.CLAUDE_PROJECTS_DIR ?? path.join(os.homedir(), ".claude", "projects"),
-);
+// ── Claude Code briefing ──────────────────────────────────────
+// /btw is a Claude Code "side question" — it answers without polluting the
+// main thread's context, and it does NOT write its turn to the project
+// transcript .jsonl. Briefing therefore runs as a two-phase exchange with
+// the UI:
+//   1. UI → "briefing_inject" → ws-gateway injects `/btw <prompt>` via
+//      tmux send-keys; the response is rendered only into the Claude TUI.
+//   2. UI watches its own xterm buffer for the response to settle, scrapes
+//      the assistant text out, and sends it back via "briefing_synth".
+//   3. ws-gateway streams the text through OpenRouter openai/gpt-audio
+//      (pcm16, stream:true) and ships back base64 WAV as "briefing_audio".
 
-// Sent via /btw so the briefing turn doesn't pollute the main thread's
-// context. Tool use isn't disabled here — /btw runs as a side question and
-// generally answers from existing context — but we still nudge it toward a
+// Sent verbatim after `/btw `. Light constraints — /btw runs as a side
+// question and answers from existing context, so we just nudge toward a
 // short spoken-style answer.
 const BRIEFING_SIDE_COMMAND = "/btw";
 const BRIEFING_PROMPT =
   "방금까지 우리가 나눈 대화를 라디오 진행자처럼 자연스럽고 짧게 한국어 대화체로 브리핑해줘. " +
   "마크다운·코드블록·불릿·이모지 없이, 음성으로 들었을 때 자연스러운 2~4문장으로만.";
-
-const BRIEFING_TOTAL_TIMEOUT_MS = 90_000;
-const BRIEFING_SETTLE_MS = 1_800;
-const BRIEFING_POLL_MS = 400;
-
-async function tmuxPanePath(sessionName: string): Promise<string | null> {
-  try {
-    const { stdout } = await execFileP("tmux", [
-      "display-message",
-      "-p",
-      "-t",
-      sessionName,
-      "#{pane_current_path}",
-    ]);
-    const p = stdout.trim();
-    return p.length > 0 ? p : null;
-  } catch {
-    return null;
-  }
-}
-
-function encodeProjectDir(cwd: string): string {
-  // Claude Code's encoding: replace every "/" with "-". A leading "/"
-  // therefore becomes a leading "-", matching the on-disk layout.
-  return cwd.replace(/\//g, "-");
-}
-
-async function findLatestJsonl(projectDir: string): Promise<string | null> {
-  let entries: string[];
-  try {
-    entries = await fs.readdir(projectDir);
-  } catch {
-    return null;
-  }
-  let bestPath: string | null = null;
-  let bestMtime = -Infinity;
-  for (const name of entries) {
-    if (!name.endsWith(".jsonl")) continue;
-    const full = path.join(projectDir, name);
-    try {
-      const st = await fs.stat(full);
-      if (!st.isFile()) continue;
-      if (st.mtimeMs > bestMtime) {
-        bestMtime = st.mtimeMs;
-        bestPath = full;
-      }
-    } catch {
-      /* ignore */
-    }
-  }
-  return bestPath;
-}
-
-type AssistantContent =
-  | { type: "text"; text?: string }
-  | { type: string; [k: string]: unknown };
-
-function extractAssistantText(line: string): string | null {
-  let obj: {
-    message?: {
-      type?: string;
-      role?: string;
-      content?: AssistantContent[] | string;
-    };
-  };
-  try {
-    obj = JSON.parse(line);
-  } catch {
-    return null;
-  }
-  const message = obj.message;
-  if (!message || message.type !== "message" || message.role !== "assistant") {
-    return null;
-  }
-  const content = message.content;
-  if (typeof content === "string") return content.trim() || null;
-  if (!Array.isArray(content)) return null;
-  const parts: string[] = [];
-  for (const c of content) {
-    if (c && typeof c === "object" && c.type === "text" && typeof c.text === "string") {
-      parts.push(c.text);
-    }
-  }
-  const joined = parts.join("\n").trim();
-  return joined.length > 0 ? joined : null;
-}
-
-async function readLastAssistantTextSince(
-  jsonlPath: string,
-  startByte: number,
-): Promise<string | null> {
-  let st: { size: number };
-  try {
-    st = await fs.stat(jsonlPath);
-  } catch {
-    return null;
-  }
-  if (st.size <= startByte) return null;
-  let fh: fs.FileHandle;
-  try {
-    fh = await fs.open(jsonlPath, "r");
-  } catch {
-    return null;
-  }
-  try {
-    const buf = Buffer.alloc(st.size - startByte);
-    await fh.read(buf, 0, buf.length, startByte);
-    const text = buf.toString("utf8");
-    const lines = text.split("\n");
-    for (let i = lines.length - 1; i >= 0; i--) {
-      const ln = lines[i];
-      if (!ln) continue;
-      const t = extractAssistantText(ln);
-      if (t) return t;
-    }
-    return null;
-  } finally {
-    try {
-      await fh.close();
-    } catch {
-      /* ignore */
-    }
-  }
-}
-
-async function statSize(p: string): Promise<number> {
-  try {
-    const st = await fs.stat(p);
-    return st.size;
-  } catch {
-    return 0;
-  }
-}
-
-// Snapshot byte-size of every .jsonl in the project dir before we inject the
-// briefing prompt, so we can later look for new content across the main
-// transcript *and* any sidechain file that /btw might write.
-async function snapshotProjectTranscripts(
-  projectDir: string,
-): Promise<Map<string, number>> {
-  const sizes = new Map<string, number>();
-  let entries: string[];
-  try {
-    entries = await fs.readdir(projectDir);
-  } catch {
-    return sizes;
-  }
-  for (const name of entries) {
-    if (!name.endsWith(".jsonl")) continue;
-    const full = path.join(projectDir, name);
-    try {
-      const st = await fs.stat(full);
-      if (!st.isFile()) continue;
-      sizes.set(full, st.size);
-    } catch {
-      /* ignore */
-    }
-  }
-  return sizes;
-}
-
-interface NewAssistantHit {
-  text: string;
-  jsonlPath: string;
-  mtimeMs: number;
-}
-
-async function readNewAssistantTextSinceSnapshot(
-  projectDir: string,
-  snapshot: Map<string, number>,
-): Promise<NewAssistantHit | null> {
-  let entries: string[];
-  try {
-    entries = await fs.readdir(projectDir);
-  } catch {
-    return null;
-  }
-  let best: NewAssistantHit | null = null;
-  for (const name of entries) {
-    if (!name.endsWith(".jsonl")) continue;
-    const full = path.join(projectDir, name);
-    let st;
-    try {
-      st = await fs.stat(full);
-    } catch {
-      continue;
-    }
-    if (!st.isFile()) continue;
-    const startByte = snapshot.get(full) ?? 0;
-    if (st.size <= startByte) continue;
-    const text = await readLastAssistantTextSince(full, startByte);
-    if (!text) continue;
-    if (!best || st.mtimeMs > best.mtimeMs) {
-      best = { text, jsonlPath: full, mtimeMs: st.mtimeMs };
-    }
-  }
-  return best;
-}
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
@@ -388,27 +184,6 @@ async function injectBriefingPrompt(sessionName: string): Promise<void> {
   await tmuxSendLiteral(sessionName, `${BRIEFING_SIDE_COMMAND} ${BRIEFING_PROMPT}`);
   await sleep(80);
   await tmuxSendKeys(sessionName, "Enter");
-}
-
-async function waitForBriefingResponse(
-  projectDir: string,
-  snapshot: Map<string, number>,
-): Promise<string | null> {
-  const deadline = Date.now() + BRIEFING_TOTAL_TIMEOUT_MS;
-  let lastText: string | null = null;
-  let lastSeenAt = Date.now();
-  while (Date.now() < deadline) {
-    const hit = await readNewAssistantTextSinceSnapshot(projectDir, snapshot);
-    if (hit && hit.text !== lastText) {
-      lastText = hit.text;
-      lastSeenAt = Date.now();
-    }
-    if (lastText && Date.now() - lastSeenAt >= BRIEFING_SETTLE_MS) {
-      return lastText;
-    }
-    await sleep(BRIEFING_POLL_MS);
-  }
-  return lastText;
 }
 
 interface BriefingAudio {
@@ -540,21 +315,12 @@ async function synthesizeViaOpenRouter(text: string): Promise<BriefingAudio> {
   return { audio: wav.toString("base64"), mime: "audio/wav", text };
 }
 
-interface BriefingResult {
+interface BriefingInjectResult {
   ok: boolean;
   reason?: string;
-  text?: string;
-  audio?: string;
-  mime?: string;
 }
 
-async function runBriefing(sessionName: string): Promise<BriefingResult> {
-  const cwd = await tmuxPanePath(sessionName);
-  if (!cwd) return { ok: false, reason: "no_pane_path" };
-  const projectDir = path.join(CLAUDE_PROJECTS_DIR, encodeProjectDir(cwd));
-  const latestJsonl = await findLatestJsonl(projectDir);
-  if (!latestJsonl) return { ok: false, reason: "no_transcript" };
-
+async function runBriefingInject(sessionName: string): Promise<BriefingInjectResult> {
   // tmux's `pane_current_command` reports the *name* of the foreground proc,
   // which on macOS comes from p_comm. Claude Code sets its proc name to its
   // version string (e.g. "2.1.133"), so we cannot match on "claude"/"node"
@@ -569,50 +335,32 @@ async function runBriefing(sessionName: string): Promise<BriefingResult> {
   if (paneCmd === "" || SHELL_NAMES.has(paneCmd)) {
     return { ok: false, reason: "claude_not_running" };
   }
-
   if (!OPENROUTER_API_KEY) {
     return { ok: false, reason: "no_api_key" };
   }
-
-  // /btw may either append to the main transcript or write to a sidechain
-  // .jsonl in the same project dir, so snapshot every .jsonl up front and
-  // diff after.
-  const snapshot = await snapshotProjectTranscripts(projectDir);
-  log("info", "ws.briefing.start", {
-    sessionName,
-    projectDir,
-    transcripts: snapshot.size,
-  });
   try {
     await injectBriefingPrompt(sessionName);
   } catch (err) {
     return { ok: false, reason: `tmux_send_failed:${(err as Error).message}` };
   }
+  return { ok: true };
+}
 
-  const text = await waitForBriefingResponse(projectDir, snapshot);
-  if (!text) {
-    log("warn", "ws.briefing.no_text", { sessionName });
-    return { ok: false, reason: "no_assistant_text" };
-  }
-  log("info", "ws.briefing.captured", {
-    sessionName,
-    chars: text.length,
-  });
+interface BriefingSynthResult {
+  ok: boolean;
+  reason?: string;
+  audio?: string;
+  mime?: string;
+}
 
+async function runBriefingSynth(text: string): Promise<BriefingSynthResult> {
+  if (!OPENROUTER_API_KEY) return { ok: false, reason: "no_api_key" };
+  if (!text || text.trim().length === 0) return { ok: false, reason: "empty_text" };
   try {
     const audio = await synthesizeViaOpenRouter(text);
-    log("info", "ws.briefing.synthesized", {
-      sessionName,
-      mime: audio.mime,
-      bytes: Math.floor((audio.audio.length * 3) / 4),
-    });
-    return { ok: true, text: audio.text, audio: audio.audio, mime: audio.mime };
+    return { ok: true, audio: audio.audio, mime: audio.mime };
   } catch (err) {
-    log("warn", "ws.briefing.tts_failed", {
-      sessionName,
-      message: (err as Error).message,
-    });
-    return { ok: false, reason: `tts_failed:${(err as Error).message}`, text };
+    return { ok: false, reason: `tts_failed:${(err as Error).message}` };
   }
 }
 // ──────────────────────────────────────────────────────────────
@@ -748,34 +496,90 @@ wss.on("connection", (ws: WebSocket, req: http.IncomingMessage, sessionName: str
         if (ws.readyState === ws.OPEN) ws.send(JSON.stringify({ type: "pong" }));
         return;
       }
-      if (msg.type === "briefing") {
+      if (msg.type === "briefing_inject") {
         const reqId = (msg as { id?: string }).id;
-        void runBriefing(sessionName)
+        log("info", "ws.briefing.inject_start", { ip, sessionName });
+        void runBriefingInject(sessionName)
           .then((res) => {
             if (ws.readyState !== ws.OPEN) return;
             if (res.ok) {
+              log("info", "ws.briefing.inject_ok", { ip, sessionName });
+              ws.send(JSON.stringify({ type: "briefing_inject_ok", id: reqId }));
+            } else {
+              log("info", "ws.briefing.inject_failed", {
+                ip,
+                sessionName,
+                reason: res.reason,
+              });
+              ws.send(
+                JSON.stringify({
+                  type: "briefing_error",
+                  id: reqId,
+                  reason: res.reason,
+                }),
+              );
+            }
+          })
+          .catch((err) => {
+            log("warn", "ws.briefing.inject_error", {
+              ip,
+              sessionName,
+              message: (err as Error).message,
+            });
+            if (ws.readyState === ws.OPEN) {
+              ws.send(
+                JSON.stringify({
+                  type: "briefing_error",
+                  id: reqId,
+                  reason: "error",
+                }),
+              );
+            }
+          });
+        return;
+      }
+      if (msg.type === "briefing_synth") {
+        const reqId = (msg as { id?: string }).id;
+        const text = (msg as { text?: string }).text ?? "";
+        log("info", "ws.briefing.synth_start", {
+          ip,
+          sessionName,
+          chars: text.length,
+        });
+        void runBriefingSynth(text)
+          .then((res) => {
+            if (ws.readyState !== ws.OPEN) return;
+            if (res.ok) {
+              log("info", "ws.briefing.synth_ok", {
+                ip,
+                sessionName,
+                bytes: Math.floor(((res.audio?.length ?? 0) * 3) / 4),
+              });
               ws.send(
                 JSON.stringify({
                   type: "briefing_audio",
                   id: reqId,
                   audio: res.audio,
                   mime: res.mime,
-                  text: res.text,
                 }),
               );
             } else {
+              log("warn", "ws.briefing.synth_failed", {
+                ip,
+                sessionName,
+                reason: res.reason,
+              });
               ws.send(
                 JSON.stringify({
                   type: "briefing_error",
                   id: reqId,
                   reason: res.reason,
-                  text: res.text,
                 }),
               );
             }
           })
           .catch((err) => {
-            log("warn", "ws.briefing.error", {
+            log("warn", "ws.briefing.synth_error", {
               ip,
               sessionName,
               message: (err as Error).message,

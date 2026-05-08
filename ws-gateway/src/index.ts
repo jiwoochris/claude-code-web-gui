@@ -417,44 +417,127 @@ interface BriefingAudio {
   text: string;
 }
 
+// OpenRouter's openai/gpt-audio rejects non-streaming requests
+// ("Audio output requires stream: true") AND restricts the streaming format
+// to pcm16 ("does not support 'mp3' when stream=true"). So we always stream
+// and reassemble PCM16 chunks ourselves, then wrap them in a WAV header for
+// the browser. OpenAI's gpt-4o audio output is fixed at 24 kHz / 16-bit /
+// mono, which matches what OpenRouter forwards.
+const OPENROUTER_PCM_SAMPLE_RATE = 24_000;
+const OPENROUTER_PCM_CHANNELS = 1;
+const OPENROUTER_PCM_BITS = 16;
+const OPENROUTER_FETCH_TIMEOUT_MS = 90_000;
+
+function wrapPcm16AsWav(pcm: Buffer): Buffer {
+  const channels = OPENROUTER_PCM_CHANNELS;
+  const sampleRate = OPENROUTER_PCM_SAMPLE_RATE;
+  const bitsPerSample = OPENROUTER_PCM_BITS;
+  const byteRate = (sampleRate * channels * bitsPerSample) / 8;
+  const blockAlign = (channels * bitsPerSample) / 8;
+  const header = Buffer.alloc(44);
+  header.write("RIFF", 0);
+  header.writeUInt32LE(36 + pcm.length, 4);
+  header.write("WAVE", 8);
+  header.write("fmt ", 12);
+  header.writeUInt32LE(16, 16);
+  header.writeUInt16LE(1, 20);
+  header.writeUInt16LE(channels, 22);
+  header.writeUInt32LE(sampleRate, 24);
+  header.writeUInt32LE(byteRate, 28);
+  header.writeUInt16LE(blockAlign, 32);
+  header.writeUInt16LE(bitsPerSample, 34);
+  header.write("data", 36);
+  header.writeUInt32LE(pcm.length, 40);
+  return Buffer.concat([header, pcm]);
+}
+
 async function synthesizeViaOpenRouter(text: string): Promise<BriefingAudio> {
   if (!OPENROUTER_API_KEY) {
     throw new Error("OPENROUTER_API_KEY not configured");
   }
-  const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${OPENROUTER_API_KEY}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model: OPENROUTER_TTS_MODEL,
-      modalities: ["text", "audio"],
-      audio: { voice: OPENROUTER_TTS_VOICE, format: "mp3" },
-      messages: [
-        {
-          role: "system",
-          content:
-            "You speak the user's text aloud verbatim in a natural, conversational Korean broadcast tone. Do not paraphrase, summarize, translate, comment, or add anything — read it as-is.",
-        },
-        { role: "user", content: text },
-      ],
-    }),
-  });
-  if (!res.ok) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), OPENROUTER_FETCH_TIMEOUT_MS);
+  let res: Response;
+  try {
+    res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+      method: "POST",
+      signal: controller.signal,
+      headers: {
+        Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: OPENROUTER_TTS_MODEL,
+        modalities: ["text", "audio"],
+        audio: { voice: OPENROUTER_TTS_VOICE, format: "pcm16" },
+        stream: true,
+        messages: [
+          {
+            role: "system",
+            content:
+              "You speak the user's text aloud verbatim in a natural, conversational Korean broadcast tone. Do not paraphrase, summarize, translate, comment, or add anything — read it as-is.",
+          },
+          { role: "user", content: text },
+        ],
+      }),
+    });
+  } catch (err) {
+    clearTimeout(timeoutId);
+    throw err;
+  }
+  if (!res.ok || !res.body) {
+    clearTimeout(timeoutId);
     const body = await res.text().catch(() => "");
     throw new Error(`openrouter ${res.status}: ${body.slice(0, 300)}`);
   }
-  const json = (await res.json()) as {
-    choices?: Array<{ message?: { audio?: { data?: string; format?: string } } }>;
-  };
-  const audio = json.choices?.[0]?.message?.audio;
-  if (!audio?.data) {
-    throw new Error("openrouter response missing audio.data");
+
+  const decoder = new TextDecoder();
+  const pcmChunks: Buffer[] = [];
+  let sseBuf = "";
+  let providerError: string | null = null;
+  try {
+    for await (const chunk of res.body as unknown as AsyncIterable<Uint8Array>) {
+      sseBuf += decoder.decode(chunk, { stream: true });
+      const lines = sseBuf.split("\n");
+      sseBuf = lines.pop() ?? "";
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed.startsWith("data:")) continue;
+        const payload = trimmed.slice(5).trimStart();
+        if (!payload || payload === "[DONE]") continue;
+        let obj: {
+          error?: { message?: string };
+          choices?: Array<{
+            delta?: { audio?: { data?: string } };
+          }>;
+        };
+        try {
+          obj = JSON.parse(payload);
+        } catch {
+          continue;
+        }
+        if (obj.error?.message) {
+          providerError = obj.error.message;
+          continue;
+        }
+        const data = obj.choices?.[0]?.delta?.audio?.data;
+        if (typeof data === "string" && data.length > 0) {
+          pcmChunks.push(Buffer.from(data, "base64"));
+        }
+      }
+    }
+  } finally {
+    clearTimeout(timeoutId);
   }
-  const fmt = audio.format ?? "mp3";
-  const mime = fmt === "wav" ? "audio/wav" : fmt === "opus" ? "audio/ogg" : "audio/mpeg";
-  return { audio: audio.data, mime, text };
+
+  if (providerError && pcmChunks.length === 0) {
+    throw new Error(`openrouter provider: ${providerError}`);
+  }
+  if (pcmChunks.length === 0) {
+    throw new Error("openrouter response had no audio data");
+  }
+  const wav = wrapPcm16AsWav(Buffer.concat(pcmChunks));
+  return { audio: wav.toString("base64"), mime: "audio/wav", text };
 }
 
 interface BriefingResult {
@@ -495,6 +578,11 @@ async function runBriefing(sessionName: string): Promise<BriefingResult> {
   // .jsonl in the same project dir, so snapshot every .jsonl up front and
   // diff after.
   const snapshot = await snapshotProjectTranscripts(projectDir);
+  log("info", "ws.briefing.start", {
+    sessionName,
+    projectDir,
+    transcripts: snapshot.size,
+  });
   try {
     await injectBriefingPrompt(sessionName);
   } catch (err) {
@@ -502,12 +590,28 @@ async function runBriefing(sessionName: string): Promise<BriefingResult> {
   }
 
   const text = await waitForBriefingResponse(projectDir, snapshot);
-  if (!text) return { ok: false, reason: "no_assistant_text" };
+  if (!text) {
+    log("warn", "ws.briefing.no_text", { sessionName });
+    return { ok: false, reason: "no_assistant_text" };
+  }
+  log("info", "ws.briefing.captured", {
+    sessionName,
+    chars: text.length,
+  });
 
   try {
     const audio = await synthesizeViaOpenRouter(text);
+    log("info", "ws.briefing.synthesized", {
+      sessionName,
+      mime: audio.mime,
+      bytes: Math.floor((audio.audio.length * 3) / 4),
+    });
     return { ok: true, text: audio.text, audio: audio.audio, mime: audio.mime };
   } catch (err) {
+    log("warn", "ws.briefing.tts_failed", {
+      sessionName,
+      message: (err as Error).message,
+    });
     return { ok: false, reason: `tts_failed:${(err as Error).message}`, text };
   }
 }

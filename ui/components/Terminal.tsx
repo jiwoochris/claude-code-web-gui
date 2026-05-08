@@ -226,6 +226,21 @@ export function Terminal({ name }: Props) {
         lineHeight: 1.15,
         allowProposedApi: true,
         scrollback: 10_000,
+        // OSC 8 hyperlink handler. Claude Code (and most modern CLIs)
+        // emit `[label](url)` as an OSC 8 escape sequence — the URL lives
+        // in cell metadata, not as visible characters — so neither the
+        // WebLinksAddon nor our markdown-text regex provider can see it.
+        // Without a linkHandler xterm parses the OSC 8 silently but does
+        // nothing on click, which matches the symptom: blue label, no
+        // hover underline, no navigation. We open the URL in a new tab on
+        // primary/middle click only.
+        linkHandler: {
+          activate(event, text) {
+            if (event.button !== 0 && event.button !== 1) return;
+            window.open(text, "_blank", "noopener,noreferrer");
+          },
+          allowNonHttpProtocols: false,
+        },
         theme: {
           background: "#ffffff",
           foreground: "#1b1f27",

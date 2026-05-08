@@ -47,7 +47,7 @@ export function Terminal({ name }: Props) {
   );
   const [claudeBusy, setClaudeBusy] = useState(false);
   type BriefingMsg =
-    | { type: "briefing_inject_ok" }
+    | { type: "briefing_inject_ok"; prompt?: string }
     | { type: "briefing_audio"; audio: string; mime: string }
     | { type: "briefing_error"; reason?: string };
   const briefingPendingRef = useRef<{
@@ -59,9 +59,12 @@ export function Terminal({ name }: Props) {
   const briefingAudioUrlRef = useRef<string | null>(null);
   // Timestamp of the last pty payload we forwarded to xterm. Set by
   // ws.onmessage for every chunk. The briefing flow uses this as a
-  // settling signal — once the pane has been quiet for ~2s after the
-  // /btw injection, we assume the side answer has finished rendering.
+  // settling signal — once the pane has been quiet for a few seconds
+  // after the /btw injection AND we've actually seen a meaningful
+  // amount of new bytes, we assume the side answer has finished
+  // rendering.
   const lastTermDataAtRef = useRef<number>(0);
+  const termBytesReceivedRef = useRef<number>(0);
 
   const sendResize = useCallback(() => {
     const ws = wsRef.current;
@@ -154,10 +157,12 @@ export function Terminal({ name }: Props) {
           }
         }
         lastTermDataAtRef.current = Date.now();
+        termBytesReceivedRef.current += ev.data.length;
         diagPeek("str", ev.data);
         t.write(ev.data);
       } else if (ev.data instanceof ArrayBuffer) {
         lastTermDataAtRef.current = Date.now();
+        termBytesReceivedRef.current += ev.data.byteLength;
         const u8 = new Uint8Array(ev.data);
         try {
           diagPeek("bin", new TextDecoder().decode(u8));
@@ -167,6 +172,7 @@ export function Terminal({ name }: Props) {
         t.write(u8);
       } else if (ev.data instanceof Blob) {
         lastTermDataAtRef.current = Date.now();
+        termBytesReceivedRef.current += ev.data.size;
         ev.data.arrayBuffer().then((buf) => {
           const u8 = new Uint8Array(buf);
           try {
@@ -715,30 +721,39 @@ export function Terminal({ name }: Props) {
     [],
   );
 
-  // Wait until xterm hasn't received any new pty bytes for `quietMs`. Caller
-  // passes `since` (timestamp captured *after* the inject ack) so we don't
-  // mistake pre-injection idleness for the response settling.
+  // Wait until xterm has settled after the /btw injection. "Settled" =
+  //   1. at least `minBytes` of pty output has arrived since `since`, AND
+  //   2. that output has been quiet for at least `quietMs`.
+  // Without (1), a thinking pause right after the inject would make the
+  // function return immediately, and we'd scrape the screen before
+  // Claude had said anything.
   const waitForTerminalSettle = useCallback(
-    (since: number, quietMs: number, maxMs: number): Promise<boolean> => {
+    (
+      since: number,
+      bytesAtStart: number,
+      quietMs: number,
+      maxMs: number,
+      minBytes: number,
+    ): Promise<boolean> => {
       return new Promise((resolve) => {
         const startedAt = Date.now();
         const tick = () => {
           const now = Date.now();
           if (now - startedAt > maxMs) {
-            // Timed out without observing a quiet stretch. The buffer may
-            // still hold a usable response, so we report timeout=false and
-            // let the caller decide whether to scrape anyway.
             resolve(false);
             return;
           }
           const last = lastTermDataAtRef.current;
-          // Settled only if (a) we've seen at least one byte after the
-          // inject and (b) it's been quiet for the full quietMs.
-          if (last >= since && now - last >= quietMs) {
+          const bytesGrowth = termBytesReceivedRef.current - bytesAtStart;
+          if (
+            bytesGrowth >= minBytes &&
+            last >= since &&
+            now - last >= quietMs
+          ) {
             resolve(true);
             return;
           }
-          setTimeout(tick, 200);
+          setTimeout(tick, 250);
         };
         tick();
       });
@@ -746,10 +761,15 @@ export function Terminal({ name }: Props) {
     [],
   );
 
-  // Pull the most recent assistant text out of the xterm scrollback. Strips
-  // Claude TUI box drawing (╭─╮ │>│ ╰─╯) and the status footer; returns the
-  // contiguous run of plain lines just above the input box.
-  const extractLastAssistantText = useCallback((): string => {
+  // Extract Claude's /btw answer out of the xterm scrollback. We anchor on
+  // the prompt itself: when the user submits `/btw <prompt>`, Claude's TUI
+  // echoes that line above the response. So we find the last buffer row
+  // that contains a distinctive head of our prompt, then walk *down* until
+  // the next input box top edge (╭) — the rows in between are the answer.
+  // tmux status bars (e.g. "[claude-code:0* ...") are stripped explicitly
+  // because they live in the same scan range and would otherwise leak into
+  // the synthesized speech.
+  const extractAnswerAfterAnchor = useCallback((anchorHead: string): string => {
     const term = termRef.current;
     if (!term) return "";
     const buf = term.buffer.active;
@@ -759,47 +779,48 @@ export function Terminal({ name }: Props) {
       raw.push(line ? line.translateToString(true) : "");
     }
 
+    let anchorIdx = -1;
+    for (let i = raw.length - 1; i >= 0; i--) {
+      if (raw[i].includes(anchorHead)) {
+        anchorIdx = i;
+        break;
+      }
+    }
+    if (anchorIdx === -1) return "";
+
     const BOX_CHARS_G = /[│┃╭╮╰╯─━└┘┌┐╔╗╚╝║═┏┓┗┛┃]/g;
     const BOX_TOP_CHARS = /[╭┌╔┏]/;
-    const isBoxOrEmpty = (s: string) => {
-      const t = s.trim();
-      if (t === "") return true;
-      const stripped = t.replace(BOX_CHARS_G, "").trim();
-      return stripped === "" || /^[╭╮╰╯┌┐└┘┏┓┗┛]/.test(t);
-    };
-
-    let boxTop = -1;
-    for (let i = raw.length - 1; i >= 0; i--) {
+    let endIdx = raw.length;
+    for (let i = anchorIdx + 1; i < raw.length; i++) {
       if (BOX_TOP_CHARS.test(raw[i])) {
-        boxTop = i;
+        endIdx = i;
         break;
       }
     }
 
-    let end = boxTop >= 0 ? boxTop : raw.length;
-    while (end > 0 && isBoxOrEmpty(raw[end - 1])) end--;
-
-    let start = end;
-    for (let i = end - 1; i >= 0; i--) {
-      if (isBoxOrEmpty(raw[i])) {
-        start = i + 1;
-        break;
-      }
-      const t = raw[i].replace(BOX_CHARS_G, "").trim();
-      if (/^>\s/.test(t)) {
-        start = i + 1;
-        break;
-      }
-      start = i;
-    }
+    // Heuristics for lines we never want to read aloud, even if they sit
+    // between the anchor and the input box.
+    const isTmuxStatusBar = (s: string) => /^\s*\[[\w-]+:[\w-]+/.test(s);
+    const isShortcutFooter = (s: string) =>
+      /\?\s*for\s+shortcuts/i.test(s) || /esc\s*to\s*interrupt/i.test(s);
+    const isContinuationOfAnchor = (s: string) =>
+      // The Claude TUI may wrap the user prompt across two rows. Strip any
+      // row that's still part of our injected text.
+      s.includes(anchorHead);
 
     const cleaned = raw
-      .slice(start, end)
+      .slice(anchorIdx + 1, endIdx)
       .map((l) => l.replace(BOX_CHARS_G, "").replace(/^\s+|\s+$/g, ""))
-      .filter((l) => l !== "")
+      .filter(
+        (l) =>
+          l !== "" &&
+          !isTmuxStatusBar(l) &&
+          !isShortcutFooter(l) &&
+          !isContinuationOfAnchor(l),
+      )
       .join(" ");
 
-    return cleaned.slice(0, 2000);
+    return cleaned.slice(0, 4000);
   }, []);
 
   const playBase64Audio = useCallback(
@@ -881,6 +902,7 @@ export function Terminal({ name }: Props) {
 
     // Phase 1: ask the gateway to inject `/btw <prompt>` into the TUI.
     const injectAt = Date.now();
+    const bytesAtInject = termBytesReceivedRef.current;
     const inject = await sendBriefingRequest({ type: "briefing_inject" }, 15_000);
     if (!inject) {
       setBanner("브리핑 요청이 시간 초과되었습니다.");
@@ -899,22 +921,44 @@ export function Terminal({ name }: Props) {
       return;
     }
 
-    // Phase 2: wait for the TUI to render and settle, then scrape the
-    // visible answer out of the xterm buffer. /btw doesn't write to
-    // ~/.claude/projects/*.jsonl, so the buffer is the only source of truth.
+    // Phase 2: wait until Claude's /btw answer has actually rendered and
+    // settled, then anchor on the echoed prompt to scrape the answer.
+    // /btw doesn't write to ~/.claude/projects/*.jsonl so the buffer is
+    // the only source of truth; we require ≥400 bytes of pty growth +
+    // 4 s of quiet so a brief pre-answer "thinking" pause can't be
+    // mistaken for completion.
     setBanner("Claude의 답변을 기다리는 중…");
-    await waitForTerminalSettle(injectAt, 3_500, 90_000);
-    const scraped = extractLastAssistantText();
-    if (!scraped) {
-      setBanner("브리핑 응답을 화면에서 찾지 못했습니다.");
-      setBriefingState("idle");
-      return;
-    }
-    // Surface the scraped text so we can see *exactly* what's about to be
-    // read aloud — useful when the audio plays but the content is wrong.
+    const settled = await waitForTerminalSettle(
+      injectAt,
+      bytesAtInject,
+      4_000,
+      90_000,
+      400,
+    );
+    // Use the head of the prompt the server actually injected as the
+    // anchor — the server echoes BRIEFING_PROMPT back in inject_ok so the
+    // two stay in lock-step even if we tweak the wording later.
+    const fullPrompt = inject.prompt ?? "";
+    const anchorHead = fullPrompt.slice(0, 14).trim() || fullPrompt;
+    const scraped = anchorHead ? extractAnswerAfterAnchor(anchorHead) : "";
     if (typeof window !== "undefined") {
       // eslint-disable-next-line no-console
-      console.info("[briefing] scraped %d chars:\n%s", scraped.length, scraped);
+      console.info(
+        "[briefing] settled=%s anchorHead=%o scraped %d chars:\n%s",
+        settled,
+        anchorHead,
+        scraped.length,
+        scraped,
+      );
+    }
+    if (!scraped) {
+      setBanner(
+        settled
+          ? "브리핑 응답을 화면에서 찾지 못했습니다."
+          : "Claude 답변을 시간 내에 받지 못했습니다.",
+      );
+      setBriefingState("idle");
+      return;
     }
 
     // Phase 3: synthesize via OpenRouter on the gateway.
@@ -951,7 +995,7 @@ export function Terminal({ name }: Props) {
     }
   }, [
     briefingState,
-    extractLastAssistantText,
+    extractAnswerAfterAnchor,
     playBase64Audio,
     sendBriefingRequest,
     stopBriefingAudio,

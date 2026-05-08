@@ -132,13 +132,12 @@ const server = http.createServer((req, res) => {
 //   3. ws-gateway streams the text through OpenRouter openai/gpt-audio
 //      (pcm16, stream:true) and ships back base64 WAV as "briefing_audio".
 
-// Sent verbatim after `/btw `. Light constraints — /btw runs as a side
-// question and answers from existing context, so we just nudge toward a
-// short spoken-style answer.
+// Sent verbatim after `/btw `. Kept short because (a) /btw answers from
+// existing context anyway and (b) the UI uses the prompt's distinctive head
+// as a textual anchor when scraping the response out of the xterm buffer —
+// shorter and more recognizable means the anchor scan is more reliable.
 const BRIEFING_SIDE_COMMAND = "/btw";
-const BRIEFING_PROMPT =
-  "방금까지 우리가 나눈 대화를 라디오 진행자처럼 자연스럽고 짧게 한국어 대화체로 브리핑해줘. " +
-  "마크다운·코드블록·불릿·이모지 없이, 음성으로 들었을 때 자연스러운 2~4문장으로만.";
+const BRIEFING_PROMPT = "방금까지 진행한 너의 마지막 작업 및 대화를 요약해줘.";
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
@@ -504,7 +503,15 @@ wss.on("connection", (ws: WebSocket, req: http.IncomingMessage, sessionName: str
             if (ws.readyState !== ws.OPEN) return;
             if (res.ok) {
               log("info", "ws.briefing.inject_ok", { ip, sessionName });
-              ws.send(JSON.stringify({ type: "briefing_inject_ok", id: reqId }));
+              // Echo the prompt back so the UI can anchor its xterm scrape
+              // on the exact text Claude will display above its answer.
+              ws.send(
+                JSON.stringify({
+                  type: "briefing_inject_ok",
+                  id: reqId,
+                  prompt: BRIEFING_PROMPT,
+                }),
+              );
             } else {
               log("info", "ws.briefing.inject_failed", {
                 ip,

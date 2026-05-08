@@ -1,5 +1,6 @@
 "use client";
 
+import { useState } from "react";
 import { useFiles } from "./FilesProvider";
 
 function basename(path: string): string {
@@ -8,8 +9,22 @@ function basename(path: string): string {
 }
 
 export function FileTabs() {
-  const { recentFiles, selected, selectFile, closeRecent } = useFiles();
+  const { recentFiles, selected, selectFile, closeRecent, reloadCurrent } =
+    useFiles();
+  const [reloading, setReloading] = useState(false);
+
   if (recentFiles.length === 0) return null;
+
+  const handleReload = async () => {
+    if (!selected || reloading) return;
+    setReloading(true);
+    try {
+      await reloadCurrent();
+    } finally {
+      // Brief flash so the user sees the spinner even on fast refreshes.
+      setTimeout(() => setReloading(false), 200);
+    }
+  };
 
   return (
     <div className="file-tabs" role="tablist" aria-label="열린 파일">
@@ -48,6 +63,17 @@ export function FileTabs() {
           </div>
         );
       })}
+      <span className="file-tabs-spacer" />
+      <button
+        type="button"
+        className={`file-tabs-action${reloading ? " spinning" : ""}`}
+        onClick={handleReload}
+        disabled={!selected || reloading}
+        title="현재 파일 다시 렌더링"
+        aria-label="현재 파일 다시 렌더링"
+      >
+        ↻
+      </button>
     </div>
   );
 }

@@ -37,6 +37,7 @@ interface FilesContextValue {
   selectFile: (relPath: string) => Promise<void>;
   closeFile: () => void;
   closeRecent: (relPath: string) => void;
+  reloadCurrent: () => Promise<void>;
   navigateTo: (relPath: string) => Promise<void>;
   refreshTree: (relPath: string) => Promise<void>;
   download: (relPath: string) => void;
@@ -78,6 +79,10 @@ export function FilesProvider({ children }: { children: React.ReactNode }) {
   const imageUrlRef = useRef<string | null>(null);
   const recentFilesRef = useRef<string[]>([]);
   const recentHydratedRef = useRef(false);
+  // Bumped whenever the iframe-rendered preview should bypass its cache
+  // (manual reload + SSE change). Appended as &v=N to PDF/render URLs so
+  // the browser actually re-fetches instead of reusing the cached blob.
+  const reloadTickRef = useRef(0);
 
   useEffect(() => {
     connIdRef.current = connId;
@@ -211,11 +216,15 @@ export function FilesProvider({ children }: { children: React.ReactNode }) {
       "rtf",
     ]);
 
+    const tickQs = reloadTickRef.current
+      ? `&v=${reloadTickRef.current}`
+      : "";
+
     if (PDF_EXTS.has(ext)) {
       setPreview({
         kind: "pdf",
         path: relPath,
-        src: `/api/fs/file?path=${encodeURIComponent(relPath)}`,
+        src: `/api/fs/file?path=${encodeURIComponent(relPath)}${tickQs}`,
         renderedFromOffice: false,
         sourceExt: "pdf",
       });
@@ -227,7 +236,7 @@ export function FilesProvider({ children }: { children: React.ReactNode }) {
       // download the source file.
       try {
         const probe = await fetch(
-          `/api/fs/render?path=${encodeURIComponent(relPath)}`,
+          `/api/fs/render?path=${encodeURIComponent(relPath)}${tickQs}`,
           { method: "HEAD", credentials: "include" },
         );
         if (probe.status === 401) {
@@ -238,7 +247,7 @@ export function FilesProvider({ children }: { children: React.ReactNode }) {
           setPreview({
             kind: "pdf",
             path: relPath,
-            src: `/api/fs/render?path=${encodeURIComponent(relPath)}`,
+            src: `/api/fs/render?path=${encodeURIComponent(relPath)}${tickQs}`,
             renderedFromOffice: true,
             sourceExt: ext,
           });
@@ -296,8 +305,8 @@ export function FilesProvider({ children }: { children: React.ReactNode }) {
 
     try {
       const res = await fetch(
-        `/api/fs/file?path=${encodeURIComponent(relPath)}`,
-        { credentials: "include" },
+        `/api/fs/file?path=${encodeURIComponent(relPath)}${tickQs}`,
+        { credentials: "include", cache: "no-store" },
       );
       if (res.status === 401) {
         window.location.href = "/login";
@@ -372,6 +381,13 @@ export function FilesProvider({ children }: { children: React.ReactNode }) {
     },
     [openFile, subscribeWatch],
   );
+
+  const reloadCurrent = useCallback(async () => {
+    const cur = selectedRef.current;
+    if (!cur) return;
+    reloadTickRef.current += 1;
+    await openFile(cur);
+  }, [openFile]);
 
   const closeFile = useCallback(() => {
     const cur = selectedRef.current;
@@ -558,6 +574,9 @@ export function FilesProvider({ children }: { children: React.ReactNode }) {
         const changed = data.path;
         const sel = selectedRef.current;
         if (sel && sel === changed && (data.type === "change" || data.type === "add")) {
+          // Bump cache-buster so iframe-rendered previews (PDF/PPTX/etc)
+          // actually re-fetch instead of reusing the cached blob.
+          reloadTickRef.current += 1;
           openFile(sel);
         }
         const lastSlash = changed.lastIndexOf("/");
@@ -613,6 +632,7 @@ export function FilesProvider({ children }: { children: React.ReactNode }) {
       selectFile,
       closeFile,
       closeRecent,
+      reloadCurrent,
       navigateTo,
       refreshTree: async (p: string) => {
         await fetchTree(p);
@@ -636,6 +656,7 @@ export function FilesProvider({ children }: { children: React.ReactNode }) {
       selectFile,
       closeFile,
       closeRecent,
+      reloadCurrent,
       navigateTo,
       fetchTree,
       download,

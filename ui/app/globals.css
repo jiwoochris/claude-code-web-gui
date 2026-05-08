@@ -1625,6 +1625,17 @@ body.col-resizing * {
   border-color: var(--fg-muted);
 }
 
+.lnb-files-toolbar .lnb-icon-btn:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.lnb-files-toolbar .lnb-icon-btn.spinning {
+  display: inline-block;
+  animation: lnb-spin 0.8s linear infinite;
+  color: var(--accent);
+}
+
 .lnb-files-err {
   flex: 0 0 auto;
   padding: 6px 10px;

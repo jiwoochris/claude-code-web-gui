@@ -40,6 +40,7 @@ interface FilesContextValue {
   reloadCurrent: () => Promise<void>;
   navigateTo: (relPath: string) => Promise<void>;
   refreshTree: (relPath: string) => Promise<void>;
+  refreshAll: () => Promise<void>;
   download: (relPath: string) => void;
   uploadFiles: (
     targetDir: string,
@@ -454,6 +455,14 @@ export function FilesProvider({ children }: { children: React.ReactNode }) {
     [fetchTree, subscribeWatch],
   );
 
+  // Re-fetch every currently expanded folder so newly created or removed
+  // entries show up even if the SSE watcher missed them (e.g. files added
+  // by an external process while the watcher was disconnected).
+  const refreshAll = useCallback(async () => {
+    const paths = Array.from(expandedRef.current);
+    await Promise.all(paths.map((p) => fetchTree(p).catch(() => null)));
+  }, [fetchTree]);
+
   const download = useCallback((relPath: string) => {
     const url = `/api/fs/download?path=${encodeURIComponent(relPath)}`;
     window.location.href = url;
@@ -637,6 +646,7 @@ export function FilesProvider({ children }: { children: React.ReactNode }) {
       refreshTree: async (p: string) => {
         await fetchTree(p);
       },
+      refreshAll,
       download,
       uploadFiles,
       resolveDropTarget,
@@ -659,6 +669,7 @@ export function FilesProvider({ children }: { children: React.ReactNode }) {
       reloadCurrent,
       navigateTo,
       fetchTree,
+      refreshAll,
       download,
       uploadFiles,
       resolveDropTarget,

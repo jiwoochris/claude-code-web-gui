@@ -22,7 +22,19 @@ export function FilesSection() {
     download,
     uploadFiles,
     resolveDropTarget,
+    refreshAll,
   } = useFiles();
+  const [refreshing, setRefreshing] = useState(false);
+
+  const handleRefresh = useCallback(async () => {
+    if (refreshing) return;
+    setRefreshing(true);
+    try {
+      await refreshAll();
+    } finally {
+      setRefreshing(false);
+    }
+  }, [refreshAll, refreshing]);
 
   // The file viewer only renders on /s/[name] (split with terminal) and
   // /files (standalone). On the dashboard or any other route, clicking a
@@ -119,6 +131,15 @@ export function FilesSection() {
         >
           {watchOk ? "● LIVE" : "○"}
         </span>
+        <button
+          className={`lnb-icon-btn${refreshing ? " spinning" : ""}`}
+          onClick={handleRefresh}
+          disabled={refreshing}
+          title="파일 트리 새로고침"
+          aria-label="파일 트리 새로고침"
+        >
+          ↻
+        </button>
         <button
           className="lnb-icon-btn"
           onClick={onPickFiles}

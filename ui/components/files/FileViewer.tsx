@@ -19,6 +19,12 @@ function isMarkdownPath(p: string | null): boolean {
   return lower.endsWith(".md") || lower.endsWith(".mdx") || lower.endsWith(".markdown");
 }
 
+export function isHtmlPath(p: string | null): boolean {
+  if (!p) return false;
+  const lower = p.toLowerCase();
+  return lower.endsWith(".html") || lower.endsWith(".htm");
+}
+
 function useIsTouchDevice(): boolean {
   const [touch, setTouch] = useState(false);
   useEffect(() => {
@@ -124,9 +130,15 @@ interface Props {
   state: PreviewState;
   onDownload: (path: string) => void;
   markdownRaw?: boolean;
+  htmlRaw?: boolean;
 }
 
-export function FileViewer({ state, onDownload, markdownRaw = false }: Props) {
+export function FileViewer({
+  state,
+  onDownload,
+  markdownRaw = false,
+  htmlRaw = false,
+}: Props) {
   const [mounted, setMounted] = useState(false);
   const hostRef = useRef<HTMLDivElement>(null);
   const isTouch = useIsTouchDevice();
@@ -212,12 +224,25 @@ export function FileViewer({ state, onDownload, markdownRaw = false }: Props) {
 
   // text
   const isMd = isMarkdownPath(state.path);
+  const isHtml = isHtmlPath(state.path);
   return (
     <div className="fv-text">
       {isMd && !markdownRaw ? (
         <div className="fv-md-host">
           <MarkdownViewer source={state.content} />
         </div>
+      ) : isHtml && !htmlRaw ? (
+        <iframe
+          className="fv-html-frame"
+          title={state.path}
+          srcDoc={state.content}
+          // No allow-same-origin: scripts run, but the iframe is a null
+          // origin and can't read this app's cookies/storage. allow-popups
+          // lets target=_blank links work; allow-forms lets demo forms
+          // submit to their own action URL.
+          sandbox="allow-scripts allow-popups allow-forms"
+          referrerPolicy="no-referrer"
+        />
       ) : (
       <div ref={hostRef} className="fv-editor-host">
         {mounted ? (

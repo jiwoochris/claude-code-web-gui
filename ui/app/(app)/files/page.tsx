@@ -8,10 +8,13 @@ import { Breadcrumb } from "@/components/files/Breadcrumb";
 export default function FilesPage() {
   const { rootName, selected, preview, navigateTo, download } = useFiles();
   const [markdownRaw, setMarkdownRaw] = useState(false);
+  const [htmlRaw, setHtmlRaw] = useState(false);
   const currentPath = selected ?? "";
 
   const isMd =
     preview.kind === "text" && /\.(md|mdx|markdown)$/i.test(preview.path);
+  const isHtml =
+    preview.kind === "text" && /\.(html|htm)$/i.test(preview.path);
   const filePath =
     preview.kind === "text" ||
     preview.kind === "image" ||
@@ -51,6 +54,15 @@ export default function FilesPage() {
             {markdownRaw ? "📖 렌더" : "📝 원본"}
           </button>
         ) : null}
+        {isHtml ? (
+          <button
+            className="btn"
+            onClick={() => setHtmlRaw((v) => !v)}
+            title="렌더 / 원본 보기 전환"
+          >
+            {htmlRaw ? "🌐 렌더" : "📝 원본"}
+          </button>
+        ) : null}
         {filePath ? (
           <button
             className="btn"
@@ -74,6 +86,7 @@ export default function FilesPage() {
           state={preview}
           onDownload={download}
           markdownRaw={markdownRaw}
+          htmlRaw={htmlRaw}
         />
       </div>
     </div>

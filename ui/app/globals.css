@@ -1227,6 +1227,14 @@ body.col-resizing * {
   background: #525659;
 }
 
+.fv-html-frame {
+  flex: 1;
+  min-height: 0;
+  width: 100%;
+  border: none;
+  background: #fff;
+}
+
 .fv-pdf-wrap {
   position: relative;
   flex: 1;

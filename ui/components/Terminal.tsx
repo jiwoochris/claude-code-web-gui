@@ -118,16 +118,6 @@ export function Terminal({ name }: Props) {
       }, 30_000);
     };
 
-    // TEMP DIAGNOSTIC — log raw payloads that carry the markdown link or
-    // an OSC 8 hyperlink so we can tell exactly what Claude Code is
-    // emitting on the wire. Logged via JSON.stringify so escape sequences
-    // (e.g. ESC ] 8 ; ; URL ESC \) are visible.
-    const diagPeek = (label: string, decoded: string) => {
-      if (decoded.includes("캘린더") || decoded.includes("\x1b]8")) {
-        console.log(`[ws raw ${label}]`, JSON.stringify(decoded).slice(0, 800));
-      }
-    };
-
     ws.onmessage = (ev) => {
       const t = termRef.current;
       if (!t) return;
@@ -158,30 +148,15 @@ export function Terminal({ name }: Props) {
         }
         lastTermDataAtRef.current = Date.now();
         termBytesReceivedRef.current += ev.data.length;
-        diagPeek("str", ev.data);
         t.write(ev.data);
       } else if (ev.data instanceof ArrayBuffer) {
         lastTermDataAtRef.current = Date.now();
         termBytesReceivedRef.current += ev.data.byteLength;
-        const u8 = new Uint8Array(ev.data);
-        try {
-          diagPeek("bin", new TextDecoder().decode(u8));
-        } catch {
-          /* ignore decode failures — diagnostic only */
-        }
-        t.write(u8);
+        t.write(new Uint8Array(ev.data));
       } else if (ev.data instanceof Blob) {
         lastTermDataAtRef.current = Date.now();
         termBytesReceivedRef.current += ev.data.size;
-        ev.data.arrayBuffer().then((buf) => {
-          const u8 = new Uint8Array(buf);
-          try {
-            diagPeek("blob", new TextDecoder().decode(u8));
-          } catch {
-            /* ignore decode failures — diagnostic only */
-          }
-          t.write(u8);
-        });
+        ev.data.arrayBuffer().then((buf) => t.write(new Uint8Array(buf)));
       }
     };
 
@@ -280,20 +255,8 @@ export function Terminal({ name }: Props) {
         // primary/middle click only.
         linkHandler: {
           activate(event, text) {
-            // TEMP DIAGNOSTIC — remove once clickable-link issue is solved.
-            console.log("[xterm linkHandler.activate]", {
-              button: event.button,
-              text,
-            });
             if (event.button !== 0 && event.button !== 1) return;
             window.open(text, "_blank", "noopener,noreferrer");
-          },
-          hover(_event, text) {
-            // TEMP DIAGNOSTIC — proves OSC 8 hyperlinks are being seen.
-            console.log("[xterm linkHandler.hover]", text);
-          },
-          leave() {
-            /* no-op */
           },
           allowNonHttpProtocols: false,
         },
@@ -391,23 +354,6 @@ export function Terminal({ name }: Props) {
           }
           const text = chars.join("");
 
-          // TEMP DIAGNOSTIC — when a line obviously *looks* like a markdown
-          // link (or part of one), log what we actually see so we can tell
-          // whether the visible chars even contain `[…](url)` or whether the
-          // link is hidden behind an OSC 8 escape with no visible chars.
-          if (
-            /\]\(https?:\/\//.test(text) ||
-            /\[[^\]]{0,40}\]\(/.test(text) ||
-            text.includes("캘린더에서 보기")
-          ) {
-            console.log("[md link provider line]", {
-              bufferLineNumber,
-              startLineNum,
-              endLineNum: curLineNum,
-              text: text.slice(0, 400),
-            });
-          }
-
           const links: import("@xterm/xterm").ILink[] = [];
           MD_LINK.lastIndex = 0;
           let m: RegExpExecArray | null;
@@ -452,33 +398,16 @@ export function Terminal({ name }: Props) {
         },
       });
 
-      // TEMP DIAGNOSTIC — log OSC 8 escape sequences as they arrive so we
-      // can confirm whether Claude Code is actually emitting hyperlinks for
-      // markdown `[label](url)` output. Returning false leaves xterm's
-      // native OSC 8 handler in charge.
-      try {
-        term.parser.registerOscHandler(8, (data) => {
-          console.log("[xterm OSC 8]", JSON.stringify(data));
-          return false;
-        });
-      } catch (e) {
-        console.warn("[xterm registerOscHandler failed]", e);
-      }
-
       term.open(host);
 
-      // Temporarily disabled while diagnosing why markdown links aren't
-      // clickable — the WebGL renderer has historically had gaps around
-      // hyperlink hover/click rendering. Re-enable once the link issue
-      // is understood.
-      // try {
-      //   const { WebglAddon } = await import("@xterm/addon-webgl");
-      //   const webgl = new WebglAddon();
-      //   webgl.onContextLoss(() => webgl.dispose());
-      //   term.loadAddon(webgl);
-      // } catch {
-      //   /* WebGL not available; fall back to canvas/DOM renderer */
-      // }
+      try {
+        const { WebglAddon } = await import("@xterm/addon-webgl");
+        const webgl = new WebglAddon();
+        webgl.onContextLoss(() => webgl.dispose());
+        term.loadAddon(webgl);
+      } catch {
+        /* WebGL not available; fall back to canvas/DOM renderer */
+      }
 
       termRef.current = term;
       fitRef.current = fit;

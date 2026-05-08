@@ -195,6 +195,12 @@ export function PdfCanvasViewer({ src, notes }: Props) {
         const host = hostRef.current;
         if (!host) return;
 
+        // Render the bitmap at viewport × DPR (clamped) for crispness, and
+        // let CSS scale the canvas to the container width via `width: 100%;
+        // height: auto`. We deliberately do NOT key the bitmap size off the
+        // host's clientWidth — on mobile the file pane sometimes mounts with
+        // 0 clientWidth, which used to collapse slots to zero width and made
+        // only speaker notes visible.
         const dpr = Math.min(window.devicePixelRatio || 1, 2);
 
         for (let pageNum = 1; pageNum <= doc.numPages; pageNum++) {
@@ -203,24 +209,18 @@ export function PdfCanvasViewer({ src, notes }: Props) {
           const page: PDFPageProxy = await doc.getPage(pageNum);
           if (cancelled) return;
 
-          const viewportBase = page.getViewport({ scale: 1 });
-          const cssWidth = host.clientWidth || viewportBase.width;
-          const scale = cssWidth / viewportBase.width;
-          const viewport = page.getViewport({ scale });
+          const viewport = page.getViewport({ scale: dpr });
 
           const slot = document.createElement("div");
           slot.className = "fv-pdf-slot";
-          slot.style.width = `${Math.floor(viewport.width)}px`;
           slot.dataset.page = String(pageNum);
           host.appendChild(slot);
           slotsRef.current[pageNum - 1] = slot;
 
           const canvas = document.createElement("canvas");
           canvas.className = "fv-pdf-page";
-          canvas.width = Math.floor(viewport.width * dpr);
-          canvas.height = Math.floor(viewport.height * dpr);
-          canvas.style.width = `${Math.floor(viewport.width)}px`;
-          canvas.style.height = `${Math.floor(viewport.height)}px`;
+          canvas.width = Math.floor(viewport.width);
+          canvas.height = Math.floor(viewport.height);
           slot.appendChild(canvas);
 
           const noteNode = document.createElement("div");
@@ -239,13 +239,10 @@ export function PdfCanvasViewer({ src, notes }: Props) {
             page.cleanup();
             continue;
           }
-          const transform =
-            dpr !== 1 ? [dpr, 0, 0, dpr, 0, 0] as const : null;
           const task = page.render({
             canvas,
             canvasContext: ctx,
             viewport,
-            transform: transform ? Array.from(transform) : undefined,
           });
           renderTasks.push(task);
           try {

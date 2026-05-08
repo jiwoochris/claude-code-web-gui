@@ -1312,7 +1312,7 @@ body.col-resizing * {
 
 .fv-pdf-page {
   display: block;
-  max-width: 100%;
+  width: 100%;
   height: auto;
   background: #ffffff;
   box-shadow: 0 1px 4px rgba(0, 0, 0, 0.4);
@@ -1322,7 +1322,10 @@ body.col-resizing * {
   display: flex;
   flex-direction: column;
   align-items: stretch;
-  max-width: 100%;
+  width: 100%;
+  /* Cap on big desktops so a single slide doesn't blow up to ultra-wide
+     widths; on mobile the viewport itself is the cap. */
+  max-width: 1280px;
   gap: 0;
 }
 

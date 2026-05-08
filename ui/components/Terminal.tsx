@@ -266,28 +266,57 @@ export function Terminal({ name }: Props) {
       // the *label* too, not just the bare URL inside the parens. The default
       // WebLinksAddon only detects exposed URLs, so when Claude prints output
       // like "[열기](https://…)" the user sees rendered-looking markdown but
-      // clicking the label does nothing. We map string indices back to cell
-      // columns so wide chars (Korean, CJK) line up correctly.
+      // clicking the label does nothing. We walk the logical (possibly
+      // wrapped) line so a single `[…](…)` that line-wraps still matches —
+      // long URLs (~100+ chars) routinely wrap across two buffer lines, and
+      // without this the regex never matches because each buffer line is
+      // searched in isolation. xterm's ILink range is single-line, so when a
+      // match spans wrapped lines we emit one ILink per buffer line covering
+      // just the cells that fall on it. We also map string indices back to
+      // cell columns so wide chars (Korean, CJK) line up correctly.
       const MD_LINK = /\[([^\]\n]+?)\]\((https?:\/\/[^\s)]+)\)/g;
       term.registerLinkProvider({
         provideLinks(bufferLineNumber, callback) {
           const t = termRef.current;
           if (!t) return callback(undefined);
-          const line = t.buffer.active.getLine(bufferLineNumber - 1);
-          if (!line) return callback(undefined);
+          const buffer = t.buffer.active;
 
-          const charStartCol: number[] = [];
-          const charEndCol: number[] = [];
+          // Walk up to the start of the logical line. `isWrapped` on a
+          // buffer line means "this line is the continuation of the line
+          // above", so we keep stepping up while the current line is
+          // wrapped.
+          let startLineNum = bufferLineNumber;
+          while (startLineNum > 1) {
+            const cur = buffer.getLine(startLineNum - 1);
+            if (!cur || !cur.isWrapped) break;
+            startLineNum -= 1;
+          }
+
+          // Walk forward collecting cells until the next line is no longer
+          // a wrap continuation. Track which buffer line and cell columns
+          // each visible char came from.
+          const cellLine: number[] = [];
+          const cellStartCol: number[] = [];
+          const cellEndCol: number[] = [];
           const chars: string[] = [];
-          for (let x = 0; x < line.length; x++) {
-            const cell = line.getCell(x);
-            if (!cell) continue;
-            const w = cell.getWidth();
-            if (w === 0) continue; // continuation cell of a wide char
-            const ch = cell.getChars();
-            chars.push(ch === "" ? " " : ch);
-            charStartCol.push(x + 1);
-            charEndCol.push(x + (w === 2 ? 2 : 1));
+          let curLineNum = startLineNum;
+          while (true) {
+            const line = buffer.getLine(curLineNum - 1);
+            if (!line) break;
+            for (let x = 0; x < line.length; x++) {
+              const cell = line.getCell(x);
+              if (!cell) continue;
+              const w = cell.getWidth();
+              if (w === 0) continue; // continuation cell of a wide char
+              const ch = cell.getChars();
+              chars.push(ch === "" ? " " : ch);
+              cellLine.push(curLineNum);
+              cellStartCol.push(x + 1);
+              cellEndCol.push(x + (w === 2 ? 2 : 1));
+            }
+            const next = buffer.getLine(curLineNum);
+            if (!next || !next.isWrapped) break;
+            curLineNum += 1;
           }
           const text = chars.join("");
 
@@ -299,17 +328,36 @@ export function Terminal({ name }: Props) {
             const endIdx = m.index + m[0].length - 1;
             if (startIdx >= chars.length || endIdx >= chars.length) continue;
             const url = m[2];
-            links.push({
-              range: {
-                start: { x: charStartCol[startIdx], y: bufferLineNumber },
-                end: { x: charEndCol[endIdx], y: bufferLineNumber },
-              },
-              text: m[0],
-              activate: (event) => {
-                if (event.button !== 0 && event.button !== 1) return;
-                window.open(url, "_blank", "noopener,noreferrer");
-              },
-            });
+
+            // Split the match into per-buffer-line segments and only emit
+            // the segment that lives on bufferLineNumber. The provider is
+            // called once per visible buffer line, and ILink.range is
+            // restricted to a single y, so each line owns its own slice.
+            let segStart = startIdx;
+            while (segStart <= endIdx) {
+              const segLine = cellLine[segStart];
+              let segEnd = segStart;
+              while (segEnd + 1 <= endIdx && cellLine[segEnd + 1] === segLine) {
+                segEnd += 1;
+              }
+              if (segLine === bufferLineNumber) {
+                links.push({
+                  range: {
+                    start: {
+                      x: cellStartCol[segStart],
+                      y: bufferLineNumber,
+                    },
+                    end: { x: cellEndCol[segEnd], y: bufferLineNumber },
+                  },
+                  text: text.slice(segStart, segEnd + 1),
+                  activate: (event) => {
+                    if (event.button !== 0 && event.button !== 1) return;
+                    window.open(url, "_blank", "noopener,noreferrer");
+                  },
+                });
+              }
+              segStart = segEnd + 1;
+            }
           }
 
           callback(links.length ? links : undefined);

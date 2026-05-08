@@ -5,6 +5,7 @@ import {
   isShellCommand,
   isValidSessionName,
   sendKey,
+  sendKeyRepeat,
   sendLine,
 } from "@/lib/tmux";
 import { log } from "@/lib/logger";
@@ -32,17 +33,23 @@ export async function POST(
     if (action === "start") {
       await sendLine(name, "claude");
     } else {
-      // Discard whatever the user has half-typed in the Claude TUI input box
-      // before injecting "/clear". A single Esc cancels in-progress streaming
-      // or clears the partial input; a *second* Esc opens Claude's rewind /
-      // previous-message selector, which would then swallow the "/clear"
-      // text. Follow up with C-u to drain any leftover readline buffer in
-      // case Esc was a no-op (idle + empty input). The short pause lets the
-      // TUI re-render an empty input before the slash command + Enter arrive
-      // together as one batch (otherwise Enter can land while the input is
-      // still settling and the TUI ignores it).
+      // Drain whatever the user has half-typed in the Claude TUI input box
+      // before injecting "/clear". A single Esc cancels in-progress
+      // streaming and may clear a single-line partial; a *second* Esc opens
+      // Claude's rewind / previous-message selector, so we only press it
+      // once. C-u alone is not enough because it kills back to the start of
+      // the *current* line only — for multi-line input typed via
+      // Shift+Enter (\\ + CR), the lines above the cursor stay put and
+      // "/clear" then lands appended to leftover text, which Claude
+      // submits as a regular prompt instead of a slash command. A long
+      // burst of Backspaces drains the entire buffer regardless of how
+      // many newlines it contains. The short pause lets the TUI re-render
+      // an empty input before the slash command + Enter arrive together
+      // as one batch (otherwise Enter can land while the input is still
+      // settling and the TUI ignores it).
       await sendKey(name, "Escape");
-      await sendKey(name, "C-u");
+      await new Promise((r) => setTimeout(r, 50));
+      await sendKeyRepeat(name, "BSpace", 512);
       await new Promise((r) => setTimeout(r, 120));
       await sendLine(name, "/clear");
     }

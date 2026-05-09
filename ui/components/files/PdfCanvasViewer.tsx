@@ -231,9 +231,18 @@ export function PdfCanvasViewer({ src, notes }: Props) {
         const loadingTask = pdfjs.getDocument({
           url: src,
           withCredentials: true,
-          // Keep memory bounded for long decks on phones.
-          disableAutoFetch: true,
+          // Pull the whole file in one go. /api/fs/render doesn't advertise
+          // Accept-Ranges, and pdf.js + a non-range server with auto-fetch
+          // disabled used to drop on-demand font fetches mid-deck — late
+          // pages then rendered with system-font fallback (random ASCII).
+          disableAutoFetch: false,
           disableStream: false,
+          disableRange: true,
+          // Some Android browsers (notably Samsung Internet) have shaky
+          // OffscreenCanvas implementations that mis-rasterize embedded
+          // CFF outlines, producing garbled glyphs. Forcing main-thread
+          // canvas keeps rendering deterministic across browsers.
+          isOffscreenCanvasSupported: false,
           // iOS Safari rejects most of the OTFs pdf.js synthesizes from
           // CFF Type 0 fonts (LibreOffice's output for Korean PPTX), and
           // when the @font-face load fails pdf.js silently falls back to

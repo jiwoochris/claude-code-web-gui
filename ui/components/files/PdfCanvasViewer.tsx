@@ -105,13 +105,20 @@ function polyfillForPdfJs(): void {
 }
 
 // Lazy ESM import so the bundle stays out of the initial chunk and Node-only
-// code paths in pdfjs are never reached during SSR. The worker is shipped as
-// a static file under /public/pdfjs/ (see scripts.copy-pdf-worker) so the
+// code paths in pdfjs are never reached during SSR. The legacy build targets
+// older browsers (down to ES2020) — the modern build assumes class field
+// privates + brand-new TC39 prototype methods that some Android browsers
+// (notably Samsung Internet's Chromium fork) ship behind flags. Using legacy
+// also means the prepended worker polyfill in /public/pdfjs/ stays
+// load-bearing only as a belt-and-suspenders measure. The worker is shipped
+// as a static file under /public/pdfjs/ (see scripts.copy-pdf-worker) so the
 // browser fetches it from the same origin without bundler-specific imports.
 async function loadPdfJs(): Promise<typeof import("pdfjs-dist")> {
   polyfillForPdfJs();
-  const pdfjs = await import("pdfjs-dist");
-  pdfjs.GlobalWorkerOptions.workerSrc = "/pdfjs/pdf.worker.min.mjs?v=polyfill2";
+  const pdfjs = (await import(
+    "pdfjs-dist/legacy/build/pdf.mjs"
+  )) as typeof import("pdfjs-dist");
+  pdfjs.GlobalWorkerOptions.workerSrc = "/pdfjs/pdf.worker.min.mjs?v=legacy1";
   return pdfjs;
 }
 

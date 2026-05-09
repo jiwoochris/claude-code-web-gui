@@ -29,8 +29,18 @@ const require = createRequire(import.meta.url);
 const here = dirname(fileURLToPath(import.meta.url));
 const pkgRoot = resolve(here, "..");
 
-const workerSrc = require.resolve("pdfjs-dist/build/pdf.worker.min.mjs");
-const pdfjsRoot = resolve(workerSrc, "..", "..");
+// Match the legacy build that PdfCanvasViewer loads on the client — the
+// modern worker assumes JS features that older Android Chromium forks
+// (Samsung Internet, In-App WebViews) don't ship by default.
+const workerSrc = require.resolve(
+  "pdfjs-dist/legacy/build/pdf.worker.min.mjs",
+);
+// cmaps/ and standard_fonts/ live next to the package's package.json, not
+// alongside the legacy build directory.
+const pdfjsRoot = resolve(
+  require.resolve("pdfjs-dist/package.json"),
+  "..",
+);
 const dstDir = join(pkgRoot, "public", "pdfjs");
 const dst = join(dstDir, "pdf.worker.min.mjs");
 

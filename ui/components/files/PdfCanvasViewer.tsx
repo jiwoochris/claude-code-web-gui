@@ -228,12 +228,24 @@ export function PdfCanvasViewer({ src, notes }: Props) {
         const pdfjs = await loadPdfJs();
         if (cancelled) return;
 
+        // iOS Safari frequently rejects the OTFs that pdf.js synthesizes
+        // from embedded CFF Type 0 fonts (the format LibreOffice emits for
+        // Korean PPTX exports). When the @font-face load fails, pdf.js
+        // silently falls back to drawing each glyph with the system font
+        // and the original character codes — and CID byte sequences come
+        // out as random uppercase ASCII ("AKSBXHDJDKWN"). Forcing the
+        // Path2D path on touch devices sidesteps the FontFace API entirely
+        // so glyphs are drawn directly from the embedded outlines.
+        const isTouch =
+          typeof window !== "undefined" &&
+          window.matchMedia?.("(pointer: coarse)").matches === true;
         const loadingTask = pdfjs.getDocument({
           url: src,
           withCredentials: true,
           // Keep memory bounded for long decks on phones.
           disableAutoFetch: true,
           disableStream: false,
+          disableFontFace: isTouch,
           // CIDFont character-code → glyph maps. PPTX-converted PDFs that
           // use Korean text reference predefined CMaps like KSCms-UHC-H;
           // without these files pdf.js can't decode the codes and renders

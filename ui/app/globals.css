@@ -1341,7 +1341,13 @@ body.col-resizing * {
 /* Selection layer that mirrors pdf.js's own viewer styles. The container's
    width/height inline styles come from setLayerDimensions and are driven by
    --total-scale-factor (set by ResizeObserver in PdfCanvasViewer). Spans
-   inside are positioned in % of that container so they track the canvas. */
+   inside are positioned in % of that container so they track the canvas.
+
+   --scale-round-x/y are required: in modern browsers setLayerDimensions
+   sets width as `round(down, calc(--total-scale-factor * pageW px),
+   var(--scale-round-x))`. Without these vars the round() call is invalid
+   and the layer collapses to 0×0 — text becomes unselectable. pdf.js's
+   own pdf_viewer.css ships the same `1px` defaults. */
 .textLayer {
   position: absolute;
   left: 0;
@@ -1356,9 +1362,13 @@ body.col-resizing * {
   transform-origin: 0 0;
   caret-color: CanvasText;
   z-index: 1;
+  -webkit-user-select: text;
+  user-select: text;
   --min-font-size: 1;
   --text-scale-factor: calc(var(--total-scale-factor) * var(--min-font-size));
   --min-font-size-inv: calc(1 / var(--min-font-size));
+  --scale-round-x: 1px;
+  --scale-round-y: 1px;
 }
 
 .textLayer :is(span, br) {
@@ -1367,6 +1377,12 @@ body.col-resizing * {
   white-space: pre;
   cursor: text;
   transform-origin: 0% 0%;
+  -webkit-user-select: text;
+  user-select: text;
+  /* iOS Safari suppresses the long-press selection callout if any ancestor
+     sets touch-callout: none. We're not, but explicitly opting in here makes
+     long-press selection reliable across iOS versions. */
+  -webkit-touch-callout: default;
 }
 
 .textLayer > :not(.markedContent),

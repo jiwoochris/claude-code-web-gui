@@ -51,6 +51,7 @@ interface FilesContextValue {
 
 const RECENT_FILES_LIMIT = 5;
 const RECENT_FILES_STORAGE_KEY = "files-recent:v1";
+const SELECTED_FILE_STORAGE_KEY = "files-selected:v1";
 
 const FilesContext = createContext<FilesContextValue | null>(null);
 
@@ -101,7 +102,10 @@ export function FilesProvider({ children }: { children: React.ReactNode }) {
     recentFilesRef.current = recentFiles;
   }, [recentFiles]);
 
-  // Hydrate recent files from localStorage once on mount.
+  // Hydrate recent files + last-viewed file path from localStorage once on
+  // mount. The actual reopen of the selected file happens in a later effect
+  // (after openFile is declared) to avoid a TDZ on the useCallback.
+  const pendingSelectedRef = useRef<string | null>(null);
   useEffect(() => {
     try {
       const raw = localStorage.getItem(RECENT_FILES_STORAGE_KEY);
@@ -114,13 +118,18 @@ export function FilesProvider({ children }: { children: React.ReactNode }) {
           if (clean.length > 0) setRecentFiles(clean);
         }
       }
+      const sel = localStorage.getItem(SELECTED_FILE_STORAGE_KEY);
+      if (sel && typeof sel === "string" && sel.length > 0) {
+        pendingSelectedRef.current = sel;
+      }
     } catch {
       /* ignore */
     }
     recentHydratedRef.current = true;
   }, []);
 
-  // Persist recent files after hydration so initial mount doesn't clobber.
+  // Persist recent files + selected after hydration so initial mount doesn't
+  // clobber stored values with empty defaults.
   useEffect(() => {
     if (!recentHydratedRef.current) return;
     try {
@@ -132,6 +141,19 @@ export function FilesProvider({ children }: { children: React.ReactNode }) {
       /* ignore */
     }
   }, [recentFiles]);
+
+  useEffect(() => {
+    if (!recentHydratedRef.current) return;
+    try {
+      if (selected) {
+        localStorage.setItem(SELECTED_FILE_STORAGE_KEY, selected);
+      } else {
+        localStorage.removeItem(SELECTED_FILE_STORAGE_KEY);
+      }
+    } catch {
+      /* ignore */
+    }
+  }, [selected]);
 
   const markLoading = useCallback((p: string, on: boolean) => {
     setLoading((prev) => {
@@ -340,6 +362,16 @@ export function FilesProvider({ children }: { children: React.ReactNode }) {
       setPreview({ kind: "error", path: relPath, message: (e as Error).message });
     }
   }, []);
+
+  // After the hydration effect has stashed the previously-viewed path,
+  // reopen it. We use openFile (not selectFile) so the recent-files order
+  // captured from localStorage is preserved as-is.
+  useEffect(() => {
+    const path = pendingSelectedRef.current;
+    if (!path) return;
+    pendingSelectedRef.current = null;
+    void openFile(path);
+  }, [openFile]);
 
   const selectFile = useCallback(
     async (relPath: string) => {

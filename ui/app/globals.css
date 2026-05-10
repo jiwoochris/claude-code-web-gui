@@ -1329,6 +1329,87 @@ body.col-resizing * {
   gap: 0;
 }
 
+/* Stack wrapper sits between the slot and the canvas/text-layer pair so the
+   text layer can absolutely position itself over the canvas's displayed CSS
+   rect. Without position:relative the .textLayer's `position:absolute` would
+   resolve against the scroll container instead of the page. */
+.fv-pdf-stack {
+  position: relative;
+  width: 100%;
+}
+
+/* Selection layer that mirrors pdf.js's own viewer styles. The container's
+   width/height inline styles come from setLayerDimensions and are driven by
+   --total-scale-factor (set by ResizeObserver in PdfCanvasViewer). Spans
+   inside are positioned in % of that container so they track the canvas. */
+.textLayer {
+  position: absolute;
+  left: 0;
+  top: 0;
+  text-align: initial;
+  overflow: clip;
+  opacity: 1;
+  line-height: 1;
+  -webkit-text-size-adjust: none;
+  text-size-adjust: none;
+  forced-color-adjust: none;
+  transform-origin: 0 0;
+  caret-color: CanvasText;
+  z-index: 1;
+  --min-font-size: 1;
+  --text-scale-factor: calc(var(--total-scale-factor) * var(--min-font-size));
+  --min-font-size-inv: calc(1 / var(--min-font-size));
+}
+
+.textLayer :is(span, br) {
+  color: transparent;
+  position: absolute;
+  white-space: pre;
+  cursor: text;
+  transform-origin: 0% 0%;
+}
+
+.textLayer > :not(.markedContent),
+.textLayer .markedContent span:not(.markedContent) {
+  z-index: 1;
+  --font-height: 0;
+  font-size: calc(var(--text-scale-factor) * var(--font-height));
+  --scale-x: 1;
+  --rotate: 0deg;
+  transform: rotate(var(--rotate)) scaleX(var(--scale-x))
+    scale(var(--min-font-size-inv));
+}
+
+.textLayer .markedContent {
+  display: contents;
+}
+
+.textLayer span[role="img"] {
+  user-select: none;
+  cursor: default;
+}
+
+.textLayer ::selection {
+  background: rgba(0, 100, 255, 0.3);
+}
+
+.textLayer br::selection {
+  background: transparent;
+}
+
+.textLayer .endOfContent {
+  display: block;
+  position: absolute;
+  inset: 100% 0 0;
+  z-index: 0;
+  cursor: default;
+  user-select: none;
+}
+
+.textLayer.selecting .endOfContent {
+  top: 0;
+}
+
 .fv-pdf-note {
   background: #fffbe6;
   color: #1b1f27;

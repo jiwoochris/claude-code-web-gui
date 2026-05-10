@@ -5,6 +5,7 @@ import type {
   PDFDocumentProxy,
   PDFPageProxy,
   RenderTask,
+  TextLayer,
 } from "pdfjs-dist";
 
 interface Props {
@@ -221,6 +222,11 @@ export function PdfCanvasViewer({ src, notes }: Props) {
     let cancelled = false;
     let doc: PDFDocumentProxy | null = null;
     const renderTasks: RenderTask[] = [];
+    const textLayers: TextLayer[] = [];
+    // Per-stack ResizeObserver entries keep --total-scale-factor in sync with
+    // the canvas's *displayed* CSS width. Without this the text layer spans
+    // (positioned/sized off that CSS variable) drift as the viewer resizes.
+    let resizeObserver: ResizeObserver | null = null;
 
     setStatus("loading");
     setError(null);
@@ -290,6 +296,28 @@ export function PdfCanvasViewer({ src, notes }: Props) {
         // only speaker notes visible.
         const dpr = Math.min(window.devicePixelRatio || 1, 2);
 
+        // Map each per-page stack wrapper to the metadata needed to keep its
+        // text layer aligned with the canvas across resizes. pdf.js sizes the
+        // text layer container as `calc(var(--total-scale-factor) * pageW px)`
+        // (see setLayerDimensions in pdfjs), so we just need that variable to
+        // equal `displayedWidth / pageWidthAtScale1` for the overlay to track.
+        const stackMeta = new WeakMap<
+          HTMLElement,
+          { pageWidth: number; layer: HTMLElement }
+        >();
+        resizeObserver = new ResizeObserver((entries) => {
+          for (const entry of entries) {
+            const meta = stackMeta.get(entry.target as HTMLElement);
+            if (!meta || meta.pageWidth <= 0) continue;
+            const displayed = entry.contentRect.width;
+            if (displayed <= 0) continue;
+            meta.layer.style.setProperty(
+              "--total-scale-factor",
+              String(displayed / meta.pageWidth),
+            );
+          }
+        });
+
         for (let pageNum = 1; pageNum <= doc.numPages; pageNum++) {
           if (cancelled) return;
 
@@ -297,6 +325,11 @@ export function PdfCanvasViewer({ src, notes }: Props) {
           if (cancelled) return;
 
           const viewport = page.getViewport({ scale: dpr });
+          // Unit-scale viewport drives the text layer: spans get positioned in
+          // % of the container so absolute scale doesn't matter, but using
+          // scale=1 means pageWidth here is in CSS px at 1× and feeds directly
+          // into the --total-scale-factor calculation above.
+          const cssViewport = page.getViewport({ scale: 1 });
 
           const slot = document.createElement("div");
           slot.className = "fv-pdf-slot";
@@ -304,11 +337,28 @@ export function PdfCanvasViewer({ src, notes }: Props) {
           host.appendChild(slot);
           slotsRef.current[pageNum - 1] = slot;
 
+          // Stack wrapper holds the canvas (visual) + text layer (selection).
+          // position:relative so the text layer can absolutely position itself
+          // over the canvas at the same displayed CSS rect.
+          const stack = document.createElement("div");
+          stack.className = "fv-pdf-stack";
+          slot.appendChild(stack);
+
           const canvas = document.createElement("canvas");
           canvas.className = "fv-pdf-page";
           canvas.width = Math.floor(viewport.width);
           canvas.height = Math.floor(viewport.height);
-          slot.appendChild(canvas);
+          stack.appendChild(canvas);
+
+          const textLayerDiv = document.createElement("div");
+          textLayerDiv.className = "textLayer";
+          // Seed --total-scale-factor with the at-load CSS pixel ratio so the
+          // overlay is roughly correct before the first ResizeObserver tick.
+          // The observer fires synchronously on observe() in modern browsers
+          // and corrects this immediately, but the seed avoids a one-frame
+          // mis-sized layer if anything throttles it.
+          textLayerDiv.style.setProperty("--total-scale-factor", "1");
+          stack.appendChild(textLayerDiv);
 
           const noteNode = document.createElement("div");
           noteNode.className = "fv-pdf-note";
@@ -334,6 +384,25 @@ export function PdfCanvasViewer({ src, notes }: Props) {
           renderTasks.push(task);
           try {
             await task.promise;
+            if (cancelled) return;
+            // Text layer uses the unicode strings pdf.js extracts via
+            // ToUnicode/CMap — independent of the FontFace pipeline we
+            // disabled for visual rendering, so Korean text stays correct
+            // here even though the on-canvas glyphs come from Path2D.
+            const textContent = await page.getTextContent();
+            if (cancelled) return;
+            const layer = new pdfjs.TextLayer({
+              textContentSource: textContent,
+              container: textLayerDiv,
+              viewport: cssViewport,
+            });
+            textLayers.push(layer);
+            stackMeta.set(stack, {
+              pageWidth: cssViewport.width,
+              layer: textLayerDiv,
+            });
+            resizeObserver.observe(stack);
+            await layer.render();
           } catch (e) {
             if (cancelled) return;
             throw e;
@@ -359,6 +428,14 @@ export function PdfCanvasViewer({ src, notes }: Props) {
           /* ignore */
         }
       }
+      for (const l of textLayers) {
+        try {
+          l.cancel();
+        } catch {
+          /* ignore */
+        }
+      }
+      resizeObserver?.disconnect();
       doc?.cleanup().catch(() => {});
       doc?.destroy().catch(() => {});
     };

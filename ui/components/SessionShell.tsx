@@ -9,6 +9,7 @@ import {
 } from "react";
 import { Terminal } from "./Terminal";
 import { FileViewer } from "./files/FileViewer";
+import { FileTabs } from "./files/FileTabs";
 import { useFiles } from "./files/FilesProvider";
 
 type MobileTab = "file" | "term";
@@ -138,6 +139,7 @@ export function SessionShell({ name }: Props) {
         <div className="session-mobile-body">
           {mobileTab === "file" ? (
             <div className="session-pane file-pane">
+              <FileTabs />
               <FileViewer state={preview} onDownload={download} />
             </div>
           ) : (
@@ -159,18 +161,7 @@ export function SessionShell({ name }: Props) {
           className="session-pane file-pane"
           style={{ flex: `0 0 ${topPct}` }}
         >
-          <div className="session-file-bar">
-            <span className="path" title={selected ?? ""}>{selected}</span>
-            <span className="spacer" />
-            <button
-              className="close"
-              onClick={closeFile}
-              title="파일 닫기"
-              aria-label="파일 닫기"
-            >
-              ✕
-            </button>
-          </div>
+          <FileTabs />
           <div className="session-file-host">
             <FileViewer state={preview} onDownload={download} />
           </div>

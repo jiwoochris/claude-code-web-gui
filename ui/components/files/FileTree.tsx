@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 
 export type EntryKind = "file" | "dir" | "symlink" | "other";
 
@@ -20,6 +20,7 @@ interface Props {
   onToggleFolder: (relPath: string) => void;
   onSelectFile: (relPath: string) => void;
   onContextMenu?: (e: React.MouseEvent, path: string, type: EntryKind) => void;
+  onDropFiles?: (targetDir: string, files: FileList) => void;
 }
 
 function joinPath(parent: string, name: string): string {
@@ -40,8 +41,10 @@ export function FileTree({
   onToggleFolder,
   onSelectFile,
   onContextMenu,
+  onDropFiles,
 }: Props) {
   const rootChildren = trees.get("") ?? [];
+  const [dragOver, setDragOver] = useState<string | null>(null);
 
   return (
     <div className="fv-tree" role="tree">
@@ -56,10 +59,28 @@ export function FileTree({
         onToggleFolder={onToggleFolder}
         onSelectFile={onSelectFile}
         onContextMenu={onContextMenu}
+        onDropFiles={onDropFiles}
+        dragOver={dragOver}
+        setDragOver={setDragOver}
       />
     </div>
   );
 }
+
+type LevelProps = Pick<
+  Props,
+  | "trees"
+  | "loading"
+  | "expanded"
+  | "selected"
+  | "onToggleFolder"
+  | "onSelectFile"
+  | "onContextMenu"
+  | "onDropFiles"
+> & {
+  dragOver: string | null;
+  setDragOver: (p: string | null) => void;
+};
 
 function TreeLevel({
   parent,
@@ -72,15 +93,14 @@ function TreeLevel({
   onToggleFolder,
   onSelectFile,
   onContextMenu,
+  onDropFiles,
+  dragOver,
+  setDragOver,
 }: {
   parent: string;
   entries: Entry[];
   depth: number;
-} & Omit<Props, "trees" | "loading" | "expanded" | "selected" | "onToggleFolder" | "onSelectFile" | "onContextMenu"> &
-  Pick<
-    Props,
-    "trees" | "loading" | "expanded" | "selected" | "onToggleFolder" | "onSelectFile" | "onContextMenu"
-  >) {
+} & LevelProps) {
   return (
     <ul className="fv-list" role="group">
       {entries.map((entry) => (
@@ -96,10 +116,22 @@ function TreeLevel({
           onToggleFolder={onToggleFolder}
           onSelectFile={onSelectFile}
           onContextMenu={onContextMenu}
+          onDropFiles={onDropFiles}
+          dragOver={dragOver}
+          setDragOver={setDragOver}
         />
       ))}
     </ul>
   );
+}
+
+function hasFiles(e: React.DragEvent): boolean {
+  const types = e.dataTransfer?.types;
+  if (!types) return false;
+  for (let i = 0; i < types.length; i++) {
+    if (types[i] === "Files") return true;
+  }
+  return false;
 }
 
 function TreeNode({
@@ -113,14 +145,14 @@ function TreeNode({
   onToggleFolder,
   onSelectFile,
   onContextMenu,
+  onDropFiles,
+  dragOver,
+  setDragOver,
 }: {
   entry: Entry;
   parent: string;
   depth: number;
-} & Pick<
-  Props,
-  "trees" | "loading" | "expanded" | "selected" | "onToggleFolder" | "onSelectFile" | "onContextMenu"
->) {
+} & LevelProps) {
   const full = useMemo(() => joinPath(parent, entry.name), [parent, entry.name]);
   const isDir = entry.type === "dir";
   const isOpen = isDir && expanded.has(full);
@@ -140,13 +172,43 @@ function TreeNode({
     onContextMenu(e, full, entry.type);
   };
 
+  const dropAccepted = !!onDropFiles && isDir;
+  const isDragTarget = dropAccepted && dragOver === full;
+
+  const handleDragOver = (e: React.DragEvent) => {
+    if (!dropAccepted || !hasFiles(e)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    if (e.dataTransfer) e.dataTransfer.dropEffect = "copy";
+    if (dragOver !== full) setDragOver(full);
+  };
+  const handleDragLeave = (e: React.DragEvent) => {
+    if (!dropAccepted) return;
+    // Only clear when leaving to something outside this node.
+    const related = e.relatedTarget as Node | null;
+    if (related && (e.currentTarget as Node).contains(related)) return;
+    if (dragOver === full) setDragOver(null);
+  };
+  const handleDrop = (e: React.DragEvent) => {
+    if (!dropAccepted || !hasFiles(e)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    setDragOver(null);
+    const files = e.dataTransfer?.files;
+    if (files && files.length > 0) onDropFiles?.(full, files);
+  };
+
   return (
     <li role="treeitem" aria-expanded={isDir ? isOpen : undefined}>
       <button
-        className={`fv-node${isSelected ? " selected" : ""}${isDir ? " is-dir" : ""}`}
+        className={`fv-node${isSelected ? " selected" : ""}${isDir ? " is-dir" : ""}${isDragTarget ? " drag-target" : ""}`}
         style={{ paddingLeft: 8 + depth * 12 }}
         onClick={handleClick}
         onContextMenu={handleContext}
+        onDragOver={dropAccepted ? handleDragOver : undefined}
+        onDragEnter={dropAccepted ? handleDragOver : undefined}
+        onDragLeave={dropAccepted ? handleDragLeave : undefined}
+        onDrop={dropAccepted ? handleDrop : undefined}
         title={entry.type === "symlink" ? "심볼릭 링크 (접근 불가)" : full}
       >
         <span className="twist">{isDir ? (isOpen ? "▾" : "▸") : ""}</span>
@@ -166,6 +228,9 @@ function TreeNode({
           onToggleFolder={onToggleFolder}
           onSelectFile={onSelectFile}
           onContextMenu={onContextMenu}
+          onDropFiles={onDropFiles}
+          dragOver={dragOver}
+          setDragOver={setDragOver}
         />
       ) : null}
     </li>

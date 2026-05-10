@@ -63,6 +63,14 @@ if (( DO_INSTALL )); then
   if want ws; then log "yarn install (ws-gateway)";  (cd ws-gateway  && yarn install --immutable); fi
 fi
 
+# 2b) font assets — generate companion Pretendard OTFs that LibreOffice can
+# address by a unique family name, so SemiBold/Light/etc. survive Core Text's
+# weight-token stripping during pptx -> PDF conversion. Idempotent.
+if want ui && [[ -x "ui/scripts/build-pretendard-weights.sh" ]]; then
+  log "build-pretendard-weights"
+  bash ui/scripts/build-pretendard-weights.sh || warn "pretendard weight build failed (continuing)"
+fi
+
 # 3) build
 if (( DO_BUILD )); then
   if want ui; then log "yarn build (ui)";            (cd ui          && yarn build); fi

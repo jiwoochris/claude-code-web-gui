@@ -1227,6 +1227,329 @@ body.col-resizing * {
   background: #525659;
 }
 
+.fv-html-frame {
+  flex: 1;
+  min-height: 0;
+  width: 100%;
+  border: none;
+  background: #fff;
+}
+
+.fv-pdf-wrap {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+.fv-pdf-canvas {
+  flex: 1;
+  min-height: 0;
+  width: 100%;
+  overflow: auto;
+  background: #525659;
+  -webkit-overflow-scrolling: touch;
+}
+
+.fv-pdf-pageind {
+  position: absolute;
+  right: 14px;
+  bottom: 14px;
+  background: rgba(0, 0, 0, 0.62);
+  color: #fff;
+  font: inherit;
+  font-variant-numeric: tabular-nums;
+  font-size: 12px;
+  padding: 4px 10px;
+  border: none;
+  border-radius: 999px;
+  cursor: pointer;
+  z-index: 2;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.35);
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.fv-pdf-pageind:hover {
+  background: rgba(0, 0, 0, 0.78);
+}
+
+.fv-pdf-pageind.editing {
+  cursor: text;
+}
+
+.fv-pdf-pageind-input {
+  width: 3ch;
+  min-width: 24px;
+  padding: 0 2px;
+  background: transparent;
+  border: none;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.6);
+  color: #fff;
+  font: inherit;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  outline: none;
+  -moz-appearance: textfield;
+}
+
+.fv-pdf-pageind-input::-webkit-outer-spin-button,
+.fv-pdf-pageind-input::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+
+.fv-pdf-pages {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  padding: 12px;
+}
+
+.fv-pdf-page {
+  display: block;
+  width: 100%;
+  height: auto;
+  background: #ffffff;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.4);
+}
+
+.fv-pdf-slot {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  width: 100%;
+  /* Cap on big desktops so a single slide doesn't blow up to ultra-wide
+     widths; on mobile the viewport itself is the cap. */
+  max-width: 1280px;
+  gap: 0;
+}
+
+/* Stack wrapper sits between the slot and the canvas/text-layer pair so the
+   text layer can absolutely position itself over the canvas's displayed CSS
+   rect. Without position:relative the .textLayer's `position:absolute` would
+   resolve against the scroll container instead of the page. */
+.fv-pdf-stack {
+  position: relative;
+  width: 100%;
+}
+
+/* Selection layer that mirrors pdf.js's own viewer styles. The container's
+   width/height inline styles come from setLayerDimensions and are driven by
+   --total-scale-factor (set by ResizeObserver in PdfCanvasViewer). Spans
+   inside are positioned in % of that container so they track the canvas.
+
+   --scale-round-x/y are required: in modern browsers setLayerDimensions
+   sets width as `round(down, calc(--total-scale-factor * pageW px),
+   var(--scale-round-x))`. Without these vars the round() call is invalid
+   and the layer collapses to 0×0 — text becomes unselectable. pdf.js's
+   own pdf_viewer.css ships the same `1px` defaults. */
+.textLayer {
+  position: absolute;
+  left: 0;
+  top: 0;
+  text-align: initial;
+  overflow: clip;
+  opacity: 1;
+  line-height: 1;
+  -webkit-text-size-adjust: none;
+  text-size-adjust: none;
+  forced-color-adjust: none;
+  transform-origin: 0 0;
+  caret-color: CanvasText;
+  z-index: 1;
+  -webkit-user-select: text;
+  user-select: text;
+  --min-font-size: 1;
+  --text-scale-factor: calc(var(--total-scale-factor) * var(--min-font-size));
+  --min-font-size-inv: calc(1 / var(--min-font-size));
+  --scale-round-x: 1px;
+  --scale-round-y: 1px;
+}
+
+.textLayer :is(span, br) {
+  color: transparent;
+  position: absolute;
+  white-space: pre;
+  cursor: text;
+  transform-origin: 0% 0%;
+  -webkit-user-select: text;
+  user-select: text;
+  /* iOS Safari suppresses the long-press selection callout if any ancestor
+     sets touch-callout: none. We're not, but explicitly opting in here makes
+     long-press selection reliable across iOS versions. */
+  -webkit-touch-callout: default;
+}
+
+.textLayer > :not(.markedContent),
+.textLayer .markedContent span:not(.markedContent) {
+  z-index: 1;
+  --font-height: 0;
+  font-size: calc(var(--text-scale-factor) * var(--font-height));
+  --scale-x: 1;
+  --rotate: 0deg;
+  transform: rotate(var(--rotate)) scaleX(var(--scale-x))
+    scale(var(--min-font-size-inv));
+}
+
+.textLayer .markedContent {
+  display: contents;
+}
+
+.textLayer span[role="img"] {
+  user-select: none;
+  cursor: default;
+}
+
+.textLayer ::selection {
+  background: rgba(0, 100, 255, 0.3);
+}
+
+.textLayer br::selection {
+  background: transparent;
+}
+
+.textLayer .endOfContent {
+  display: block;
+  position: absolute;
+  inset: 100% 0 0;
+  z-index: 0;
+  cursor: default;
+  user-select: none;
+}
+
+.textLayer.selecting .endOfContent {
+  top: 0;
+}
+
+.fv-pdf-note {
+  background: #fffbe6;
+  color: #1b1f27;
+  border: 1px solid #e0d28a;
+  border-top: none;
+  border-radius: 0 0 4px 4px;
+  padding: 10px 14px;
+  font-size: 13px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.4);
+}
+
+.fv-md-host {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  background: var(--bg);
+  -webkit-overflow-scrolling: touch;
+}
+
+.fv-md-body {
+  max-width: 860px;
+  margin: 0 auto;
+  padding: 20px 24px 80px;
+  color: var(--fg);
+  line-height: 1.65;
+  font-size: 15px;
+  word-break: break-word;
+}
+
+.fv-md-body h1,
+.fv-md-body h2,
+.fv-md-body h3,
+.fv-md-body h4,
+.fv-md-body h5,
+.fv-md-body h6 {
+  margin: 1.4em 0 0.6em;
+  font-weight: 700;
+  line-height: 1.25;
+}
+
+.fv-md-body h1 { font-size: 1.9em; border-bottom: 1px solid var(--border); padding-bottom: 0.3em; }
+.fv-md-body h2 { font-size: 1.5em; border-bottom: 1px solid var(--border); padding-bottom: 0.3em; }
+.fv-md-body h3 { font-size: 1.25em; }
+.fv-md-body h4 { font-size: 1.05em; }
+
+.fv-md-body p { margin: 0.6em 0; }
+
+.fv-md-body a {
+  color: var(--accent);
+  text-decoration: underline;
+}
+
+.fv-md-body code {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 0.9em;
+  padding: 0.15em 0.35em;
+  border-radius: 4px;
+  background: var(--bg-soft, rgba(127, 127, 127, 0.12));
+}
+
+.fv-md-body pre {
+  background: var(--bg-soft, rgba(127, 127, 127, 0.12));
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 12px 14px;
+  overflow: auto;
+  -webkit-overflow-scrolling: touch;
+  font-size: 0.9em;
+}
+
+.fv-md-body pre code {
+  background: transparent;
+  padding: 0;
+  border-radius: 0;
+  font-size: inherit;
+}
+
+.fv-md-body blockquote {
+  margin: 0.8em 0;
+  padding: 0.2em 0 0.2em 12px;
+  border-left: 3px solid var(--accent);
+  color: var(--muted);
+}
+
+.fv-md-body ul,
+.fv-md-body ol {
+  margin: 0.6em 0;
+  padding-left: 1.6em;
+}
+
+.fv-md-body li { margin: 0.2em 0; }
+
+.fv-md-body table {
+  border-collapse: collapse;
+  margin: 0.8em 0;
+  width: 100%;
+  display: block;
+  overflow-x: auto;
+}
+
+.fv-md-body th,
+.fv-md-body td {
+  border: 1px solid var(--border);
+  padding: 6px 10px;
+  text-align: left;
+}
+
+.fv-md-body th { background: var(--bg-soft, rgba(127, 127, 127, 0.08)); }
+
+.fv-md-body img {
+  max-width: 100%;
+  height: auto;
+  border-radius: 4px;
+}
+
+.fv-md-body hr {
+  border: 0;
+  border-top: 1px solid var(--border);
+  margin: 1.4em 0;
+}
+
 .fv-tag {
   font-size: 11px;
   padding: 2px 8px;
@@ -1278,6 +1601,80 @@ body.col-resizing * {
   display: flex;
   flex-direction: column;
   min-height: 0;
+  position: relative;
+}
+
+.lnb-files.drag-active {
+  outline: 1px dashed var(--accent);
+  outline-offset: -4px;
+}
+
+.lnb-files-dropzone {
+  position: absolute;
+  inset: 0;
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+  z-index: 5;
+}
+
+.lnb-files-dropzone .msg {
+  background: var(--bg-elev-2);
+  border: 1px dashed var(--accent);
+  color: var(--fg);
+  padding: 12px 14px;
+  border-radius: 8px;
+  text-align: center;
+  max-width: 90%;
+}
+
+.lnb-files-dropzone .msg .title {
+  font-weight: 600;
+  font-size: 13px;
+  margin-bottom: 4px;
+}
+
+.lnb-files-dropzone .msg .hint {
+  font-size: 11px;
+  color: var(--fg-muted);
+}
+
+.lnb-files-progress {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  font-size: 11px;
+  color: var(--fg-muted);
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+  border-bottom: 1px solid var(--border);
+}
+
+.lnb-files-progress .spin {
+  display: inline-block;
+  animation: lnb-spin 1s linear infinite;
+  color: var(--accent);
+}
+
+.lnb-files-progress .text.ok {
+  color: var(--ok);
+}
+
+.lnb-files-progress .text.err {
+  color: var(--danger);
+}
+
+@keyframes lnb-spin {
+  to { transform: rotate(360deg); }
+}
+
+.fv-node.drag-target {
+  background: color-mix(in srgb, var(--accent) 25%, transparent);
+  outline: 1px dashed var(--accent);
+  outline-offset: -2px;
 }
 
 .lnb-files-toolbar {
@@ -1326,6 +1723,17 @@ body.col-resizing * {
 .lnb-files-toolbar .lnb-icon-btn:hover {
   color: var(--fg);
   border-color: var(--fg-muted);
+}
+
+.lnb-files-toolbar .lnb-icon-btn:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.lnb-files-toolbar .lnb-icon-btn.spinning {
+  display: inline-block;
+  animation: lnb-spin 0.8s linear infinite;
+  color: var(--accent);
 }
 
 .lnb-files-err {
@@ -1506,6 +1914,148 @@ body.col-resizing * {
 .session-mobile-body > .session-pane {
   flex: 1 1 auto;
   min-height: 0;
+}
+
+/* ---------- File tabs (IDE-style recent files) ---------- */
+
+.file-tabs {
+  flex: 0 0 34px;
+  height: 34px;
+  display: flex;
+  align-items: stretch;
+  gap: 2px;
+  padding: 4px 6px 0;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-elev);
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: thin;
+}
+
+.file-tabs::-webkit-scrollbar {
+  height: 4px;
+}
+
+.file-tabs::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 2px;
+}
+
+.file-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+  max-width: 220px;
+  padding: 0 6px 0 10px;
+  border: 1px solid var(--border);
+  border-bottom: none;
+  border-top-left-radius: 6px;
+  border-top-right-radius: 6px;
+  background: transparent;
+  color: var(--fg-muted);
+  font-size: 12px;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+  cursor: pointer;
+  user-select: none;
+  position: relative;
+  top: 1px;
+}
+
+.file-tab:hover {
+  color: var(--fg);
+  background: var(--bg-elev-2);
+}
+
+.file-tab.active {
+  color: var(--fg);
+  background: var(--bg);
+  border-color: var(--border-strong);
+}
+
+.file-tab.active::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: -1px;
+  height: 1px;
+  background: var(--bg);
+}
+
+.file-tab .tab-name {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 180px;
+}
+
+.file-tab .tab-close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--fg-dim);
+  font-size: 11px;
+  line-height: 1;
+  cursor: pointer;
+  opacity: 0.6;
+}
+
+.file-tab:hover .tab-close,
+.file-tab.active .tab-close {
+  opacity: 1;
+}
+
+.file-tab .tab-close:hover {
+  background: var(--bg-elev-2);
+  color: var(--danger);
+}
+
+.file-tabs-spacer {
+  flex: 1 0 8px;
+  min-width: 8px;
+}
+
+.file-tabs-action {
+  align-self: center;
+  flex: 0 0 auto;
+  width: 28px;
+  height: 24px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--fg-muted);
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+  margin-right: 4px;
+}
+
+.file-tabs-action:hover:not(:disabled) {
+  color: var(--fg);
+  border-color: var(--border-strong);
+  background: var(--bg-elev-2);
+}
+
+.file-tabs-action:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.file-tabs-action.spinning {
+  animation: file-tabs-spin 600ms linear infinite;
+}
+
+@keyframes file-tabs-spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
 }
 
 /* ---------- Responsive ---------- */

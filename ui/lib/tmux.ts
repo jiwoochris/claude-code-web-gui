@@ -89,6 +89,22 @@ export async function sendKey(name: string, key: string): Promise<void> {
   await run("tmux", ["send-keys", "-t", name, key], { timeout: 3000 });
 }
 
+// Repeat a single key `count` times via tmux's `-N` flag. tmux dispatches
+// the bursts in one shot, so the receiving TUI sees them as a tight
+// sequence (no per-key network round trip). Useful for draining a TUI's
+// input box without knowing its current length.
+export async function sendKeyRepeat(
+  name: string,
+  key: string,
+  count: number,
+): Promise<void> {
+  await run(
+    "tmux",
+    ["send-keys", "-t", name, "-N", String(count), key],
+    { timeout: 3000 },
+  );
+}
+
 const SHELL_COMMANDS = new Set([
   "bash",
   "zsh",

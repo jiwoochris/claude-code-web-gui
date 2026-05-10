@@ -42,13 +42,34 @@ export function Terminal({ name }: Props) {
     rows: 40,
   });
   const [banner, setBanner] = useState<string | null>(null);
-  const [speaking, setSpeaking] = useState(false);
+  const [briefingState, setBriefingState] = useState<"idle" | "loading" | "playing">(
+    "idle",
+  );
   const [claudeBusy, setClaudeBusy] = useState(false);
+  type BriefingMsg =
+    | { type: "briefing_inject_ok"; prompt?: string }
+    | { type: "briefing_audio"; audio: string; mime: string }
+    | { type: "briefing_error"; reason?: string };
   const briefingPendingRef = useRef<{
     id: string;
-    resolve: (text: string | null) => void;
+    resolve: (msg: BriefingMsg | null) => void;
     timer: ReturnType<typeof setTimeout>;
   } | null>(null);
+  const briefingAudioRef = useRef<HTMLAudioElement | null>(null);
+  const briefingAudioUrlRef = useRef<string | null>(null);
+  // Timestamp of the last pty payload we forwarded to xterm. Set by
+  // ws.onmessage for every chunk. The briefing flow uses this as a
+  // settling signal — once the pane has been quiet for a few seconds
+  // after the /btw injection AND we've actually seen a meaningful
+  // amount of new bytes, we assume the side answer has finished
+  // rendering.
+  const lastTermDataAtRef = useRef<number>(0);
+  const termBytesReceivedRef = useRef<number>(0);
+  // label → URL map populated from `link_map` messages pushed by ws-gateway.
+  // The TUI strips URLs out of `[label](url)` before they reach xterm, so
+  // we recover them from the project's session transcript and look up the
+  // matching label glyphs whenever xterm asks for links on a buffer line.
+  const linkMapRef = useRef<Map<string, string>>(new Map());
 
   const sendResize = useCallback(() => {
     const ws = wsRef.current;
@@ -113,12 +134,37 @@ export function Terminal({ name }: Props) {
           try {
             const msg = JSON.parse(ev.data);
             if (msg?.type === "ping" || msg?.type === "pong") return;
-            if (msg?.type === "briefing") {
+            if (
+              msg?.type === "briefing_inject_ok" ||
+              msg?.type === "briefing_audio" ||
+              msg?.type === "briefing_error"
+            ) {
               const pending = briefingPendingRef.current;
               if (pending && (!msg.id || msg.id === pending.id)) {
                 clearTimeout(pending.timer);
                 briefingPendingRef.current = null;
-                pending.resolve(typeof msg.text === "string" ? msg.text : null);
+                pending.resolve(msg as BriefingMsg);
+              }
+              return;
+            }
+            if (msg?.type === "link_map" && Array.isArray(msg.entries)) {
+              let added = false;
+              for (const e of msg.entries) {
+                if (
+                  typeof e?.label === "string" &&
+                  typeof e?.url === "string" &&
+                  !linkMapRef.current.has(e.label)
+                ) {
+                  linkMapRef.current.set(e.label, e.url);
+                  added = true;
+                }
+              }
+              if (added) {
+                // Force xterm to re-evaluate link providers across the
+                // visible viewport so newly-known labels become clickable
+                // without needing a redraw from the pty.
+                const term = termRef.current;
+                if (term) term.refresh(0, term.rows - 1);
               }
               return;
             }
@@ -126,10 +172,16 @@ export function Terminal({ name }: Props) {
             /* fall through and write as raw text */
           }
         }
+        lastTermDataAtRef.current = Date.now();
+        termBytesReceivedRef.current += ev.data.length;
         t.write(ev.data);
       } else if (ev.data instanceof ArrayBuffer) {
+        lastTermDataAtRef.current = Date.now();
+        termBytesReceivedRef.current += ev.data.byteLength;
         t.write(new Uint8Array(ev.data));
       } else if (ev.data instanceof Blob) {
+        lastTermDataAtRef.current = Date.now();
+        termBytesReceivedRef.current += ev.data.size;
         ev.data.arrayBuffer().then((buf) => t.write(new Uint8Array(buf)));
       }
     };
@@ -219,6 +271,21 @@ export function Terminal({ name }: Props) {
         lineHeight: 1.15,
         allowProposedApi: true,
         scrollback: 10_000,
+        // OSC 8 hyperlink handler. Claude Code (and most modern CLIs)
+        // emit `[label](url)` as an OSC 8 escape sequence — the URL lives
+        // in cell metadata, not as visible characters — so neither the
+        // WebLinksAddon nor our markdown-text regex provider can see it.
+        // Without a linkHandler xterm parses the OSC 8 silently but does
+        // nothing on click, which matches the symptom: blue label, no
+        // hover underline, no navigation. We open the URL in a new tab on
+        // primary/middle click only.
+        linkHandler: {
+          activate(event, text) {
+            if (event.button !== 0 && event.button !== 1) return;
+            window.open(text, "_blank", "noopener,noreferrer");
+          },
+          allowNonHttpProtocols: false,
+        },
         theme: {
           background: "#ffffff",
           foreground: "#1b1f27",
@@ -247,12 +314,171 @@ export function Terminal({ name }: Props) {
       term.loadAddon(fit);
       term.loadAddon(
         new WebLinksAddon((event, uri) => {
-          // Don't hijack selection drags — only act on a real click.
-          if (event.type !== "click" && event.type !== "auxclick") return;
+          // xterm fires activate from mouseup once it has confirmed the
+          // mousedown/mouseup landed on the same link, so we only need to
+          // gate out non-primary buttons here (right-click, etc.).
           if (event.button !== 0 && event.button !== 1) return;
           window.open(uri, "_blank", "noopener,noreferrer");
         }),
       );
+
+      // Markdown-style link provider: makes `[label](https://…)` clickable on
+      // the *label* too, not just the bare URL inside the parens. The default
+      // WebLinksAddon only detects exposed URLs, so when Claude prints output
+      // like "[열기](https://…)" the user sees rendered-looking markdown but
+      // clicking the label does nothing. We walk the logical (possibly
+      // wrapped) line so a single `[…](…)` that line-wraps still matches —
+      // long URLs (~100+ chars) routinely wrap across two buffer lines, and
+      // without this the regex never matches because each buffer line is
+      // searched in isolation. xterm's ILink range is single-line, so when a
+      // match spans wrapped lines we emit one ILink per buffer line covering
+      // just the cells that fall on it. We also map string indices back to
+      // cell columns so wide chars (Korean, CJK) line up correctly.
+      const MD_LINK = /\[([^\]\n]+?)\]\((https?:\/\/[^\s)]+)\)/g;
+      term.registerLinkProvider({
+        provideLinks(bufferLineNumber, callback) {
+          const t = termRef.current;
+          if (!t) return callback(undefined);
+          const buffer = t.buffer.active;
+
+          // Walk up to the start of the logical line. `isWrapped` on a
+          // buffer line means "this line is the continuation of the line
+          // above", so we keep stepping up while the current line is
+          // wrapped.
+          let startLineNum = bufferLineNumber;
+          while (startLineNum > 1) {
+            const cur = buffer.getLine(startLineNum - 1);
+            if (!cur || !cur.isWrapped) break;
+            startLineNum -= 1;
+          }
+
+          // Walk forward collecting cells until the next line is no longer
+          // a wrap continuation. Track which buffer line and cell columns
+          // each visible char came from.
+          const cellLine: number[] = [];
+          const cellStartCol: number[] = [];
+          const cellEndCol: number[] = [];
+          const chars: string[] = [];
+          let curLineNum = startLineNum;
+          while (true) {
+            const line = buffer.getLine(curLineNum - 1);
+            if (!line) break;
+            for (let x = 0; x < line.length; x++) {
+              const cell = line.getCell(x);
+              if (!cell) continue;
+              const w = cell.getWidth();
+              if (w === 0) continue; // continuation cell of a wide char
+              const ch = cell.getChars();
+              chars.push(ch === "" ? " " : ch);
+              cellLine.push(curLineNum);
+              cellStartCol.push(x + 1);
+              cellEndCol.push(x + (w === 2 ? 2 : 1));
+            }
+            const next = buffer.getLine(curLineNum);
+            if (!next || !next.isWrapped) break;
+            curLineNum += 1;
+          }
+          const text = chars.join("");
+
+          const links: import("@xterm/xterm").ILink[] = [];
+          MD_LINK.lastIndex = 0;
+          let m: RegExpExecArray | null;
+          while ((m = MD_LINK.exec(text)) !== null) {
+            const startIdx = m.index;
+            const endIdx = m.index + m[0].length - 1;
+            if (startIdx >= chars.length || endIdx >= chars.length) continue;
+            const url = m[2];
+
+            // Split the match into per-buffer-line segments and only emit
+            // the segment that lives on bufferLineNumber. The provider is
+            // called once per visible buffer line, and ILink.range is
+            // restricted to a single y, so each line owns its own slice.
+            let segStart = startIdx;
+            while (segStart <= endIdx) {
+              const segLine = cellLine[segStart];
+              let segEnd = segStart;
+              while (segEnd + 1 <= endIdx && cellLine[segEnd + 1] === segLine) {
+                segEnd += 1;
+              }
+              if (segLine === bufferLineNumber) {
+                links.push({
+                  range: {
+                    start: {
+                      x: cellStartCol[segStart],
+                      y: bufferLineNumber,
+                    },
+                    end: { x: cellEndCol[segEnd], y: bufferLineNumber },
+                  },
+                  text: text.slice(segStart, segEnd + 1),
+                  activate: (event) => {
+                    if (event.button !== 0 && event.button !== 1) return;
+                    window.open(url, "_blank", "noopener,noreferrer");
+                  },
+                });
+              }
+              segStart = segEnd + 1;
+            }
+          }
+
+          // Transcript-recovered labels: Claude Code's TUI strips the
+          // URL out of `[label](url)` before it hits xterm, so we recover
+          // the mapping from the project's session transcript (pushed by
+          // ws-gateway as `link_map`) and look up the visible label
+          // glyphs here. Same per-buffer-line segmentation as above.
+          if (linkMapRef.current.size > 0) {
+            const pushSegmentedLink = (
+              startIdx: number,
+              endIdx: number,
+              url: string,
+            ) => {
+              let segStart = startIdx;
+              while (segStart <= endIdx) {
+                const segLine = cellLine[segStart];
+                let segEnd = segStart;
+                while (
+                  segEnd + 1 <= endIdx &&
+                  cellLine[segEnd + 1] === segLine
+                ) {
+                  segEnd += 1;
+                }
+                if (segLine === bufferLineNumber) {
+                  links.push({
+                    range: {
+                      start: {
+                        x: cellStartCol[segStart],
+                        y: bufferLineNumber,
+                      },
+                      end: { x: cellEndCol[segEnd], y: bufferLineNumber },
+                    },
+                    text: text.slice(segStart, segEnd + 1),
+                    activate: (event) => {
+                      if (event.button !== 0 && event.button !== 1) return;
+                      window.open(url, "_blank", "noopener,noreferrer");
+                    },
+                  });
+                }
+                segStart = segEnd + 1;
+              }
+            };
+
+            for (const [label, url] of linkMapRef.current) {
+              if (!label) continue;
+              let from = 0;
+              while (from < text.length) {
+                const idx = text.indexOf(label, from);
+                if (idx < 0) break;
+                const endIdx = idx + label.length - 1;
+                from = endIdx + 1;
+                if (endIdx >= chars.length) break;
+                pushSegmentedLink(idx, endIdx, url);
+              }
+            }
+          }
+
+          callback(links.length ? links : undefined);
+        },
+      });
+
       term.open(host);
 
       try {
@@ -267,13 +493,16 @@ export function Terminal({ name }: Props) {
       termRef.current = term;
       fitRef.current = fit;
 
-      // Shift+Enter sends ESC+CR (the same sequence native terminals like
-      // iTerm/Terminal.app emit for Alt/Shift+Enter). TUIs such as Claude
-      // Code treat this as "insert newline" while a bare CR still submits.
-      // A lone LF is dropped by some TUIs inside tmux, which is why the
-      // web GUI's old `\n` payload didn't work. Ctrl+C copies the current
-      // selection when there is one (otherwise it falls through as SIGINT).
-      // Ctrl+V pastes from the browser clipboard.
+      // Shift+Enter sends the literal backslash + CR pair (0x5c 0x0d).
+      // Claude Code's input parser treats `\` immediately followed by Enter
+      // as "insert newline, don't submit" in every terminal regardless of
+      // keyboard-protocol negotiation. The CSI u variant (ESC[13;2u) only
+      // works once Claude Code has DECSET kitty keyboard mode and the
+      // terminal chain (xterm.js -> tmux -> claude) all agree on the
+      // protocol — fragile in our setup. The backslash-Enter convention is
+      // what `/terminal-setup` configures iTerm2/VS Code/WezTerm to emit.
+      // Ctrl+C copies the current selection when there is one (otherwise it
+      // falls through as SIGINT). Ctrl+V pastes from the browser clipboard.
       const isCoarsePointer =
         typeof window !== "undefined" &&
         window.matchMedia?.("(pointer: coarse)").matches;
@@ -308,10 +537,30 @@ export function Terminal({ name }: Props) {
           !ev.altKey &&
           !ev.metaKey
         ) {
-          const ws = wsRef.current;
-          if (ws && ws.readyState === WebSocket.OPEN) {
-            ws.send(new TextEncoder().encode("\x1b\r"));
-          }
+          // Returning false from xterm's custom handler stops xterm's own
+          // processing but does NOT cancel the browser default — the hidden
+          // textarea would otherwise insert "\n" and xterm would forward
+          // that as a stray byte right after our manual "\\\r", which
+          // Claude Code then sees as a submit. preventDefault keeps the
+          // textarea silent so only our two bytes reach the pty.
+          ev.preventDefault();
+          ev.stopPropagation();
+          // Defer the actual send by one task tick. When a Korean IME (or
+          // any other composing IME) is on the last character of a run,
+          // the browser commits that character on the Enter keydown and
+          // fires the `input` event immediately after our handler. If we
+          // send "\\\r" synchronously here, the committed character (e.g.
+          // the "요" in "안녕하세요") arrives at the pty AFTER our newline
+          // payload — Claude Code then renders it as `안녕하세\n요`. A
+          // setTimeout 0 lets the input event flush the composed text via
+          // term.onData first, so the bytes hit the pty in the right
+          // order: composed text, then newline.
+          setTimeout(() => {
+            const ws = wsRef.current;
+            if (ws && ws.readyState === WebSocket.OPEN) {
+              ws.send(new TextEncoder().encode("\\\r"));
+            }
+          }, 0);
           return false;
         }
 
@@ -428,7 +677,109 @@ export function Terminal({ name }: Props) {
     void connect();
   };
 
-  const extractLastAssistantText = useCallback((): string => {
+  const stopBriefingAudio = useCallback(() => {
+    const audio = briefingAudioRef.current;
+    if (audio) {
+      try {
+        audio.pause();
+      } catch {
+        /* noop */
+      }
+      audio.src = "";
+      briefingAudioRef.current = null;
+    }
+    const url = briefingAudioUrlRef.current;
+    if (url) {
+      URL.revokeObjectURL(url);
+      briefingAudioUrlRef.current = null;
+    }
+  }, []);
+
+  // Single in-flight briefing slot. Replacing the pending entry rejects the
+  // previous one so we never hang multiple resolvers.
+  const sendBriefingRequest = useCallback(
+    (payload: { type: "briefing_inject" | "briefing_synth"; text?: string }, timeoutMs: number) => {
+      const ws = wsRef.current;
+      if (!ws || ws.readyState !== WebSocket.OPEN) return Promise.resolve(null);
+      const prev = briefingPendingRef.current;
+      if (prev) {
+        clearTimeout(prev.timer);
+        prev.resolve(null);
+        briefingPendingRef.current = null;
+      }
+      return new Promise<BriefingMsg | null>((resolve) => {
+        const id =
+          typeof crypto !== "undefined" && "randomUUID" in crypto
+            ? crypto.randomUUID()
+            : Math.random().toString(36).slice(2);
+        const timer = setTimeout(() => {
+          if (briefingPendingRef.current?.id === id) {
+            briefingPendingRef.current = null;
+            resolve(null);
+          }
+        }, timeoutMs);
+        briefingPendingRef.current = { id, resolve, timer };
+        try {
+          ws.send(JSON.stringify({ ...payload, id }));
+        } catch {
+          clearTimeout(timer);
+          briefingPendingRef.current = null;
+          resolve(null);
+        }
+      });
+    },
+    [],
+  );
+
+  // Wait until xterm has settled after the /btw injection. "Settled" =
+  //   1. at least `minBytes` of pty output has arrived since `since`, AND
+  //   2. that output has been quiet for at least `quietMs`.
+  // Without (1), a thinking pause right after the inject would make the
+  // function return immediately, and we'd scrape the screen before
+  // Claude had said anything.
+  const waitForTerminalSettle = useCallback(
+    (
+      since: number,
+      bytesAtStart: number,
+      quietMs: number,
+      maxMs: number,
+      minBytes: number,
+    ): Promise<boolean> => {
+      return new Promise((resolve) => {
+        const startedAt = Date.now();
+        const tick = () => {
+          const now = Date.now();
+          if (now - startedAt > maxMs) {
+            resolve(false);
+            return;
+          }
+          const last = lastTermDataAtRef.current;
+          const bytesGrowth = termBytesReceivedRef.current - bytesAtStart;
+          if (
+            bytesGrowth >= minBytes &&
+            last >= since &&
+            now - last >= quietMs
+          ) {
+            resolve(true);
+            return;
+          }
+          setTimeout(tick, 250);
+        };
+        tick();
+      });
+    },
+    [],
+  );
+
+  // Extract Claude's /btw answer out of the xterm scrollback. We anchor on
+  // the prompt itself: when the user submits `/btw <prompt>`, Claude's TUI
+  // echoes that line above the response. So we find the last buffer row
+  // that contains a distinctive head of our prompt, then walk *down* until
+  // the next input box top edge (╭) — the rows in between are the answer.
+  // tmux status bars (e.g. "[claude-code:0* ...") are stripped explicitly
+  // because they live in the same scan range and would otherwise leak into
+  // the synthesized speech.
+  const extractAnswerAfterAnchor = useCallback((anchorHead: string): string => {
     const term = termRef.current;
     if (!term) return "";
     const buf = term.buffer.active;
@@ -438,97 +789,78 @@ export function Terminal({ name }: Props) {
       raw.push(line ? line.translateToString(true) : "");
     }
 
+    let anchorIdx = -1;
+    for (let i = raw.length - 1; i >= 0; i--) {
+      if (raw[i].includes(anchorHead)) {
+        anchorIdx = i;
+        break;
+      }
+    }
+    if (anchorIdx === -1) return "";
+
     const BOX_CHARS_G = /[│┃╭╮╰╯─━└┘┌┐╔╗╚╝║═┏┓┗┛┃]/g;
     const BOX_TOP_CHARS = /[╭┌╔┏]/;
-    const isBoxOrEmpty = (s: string) => {
-      const t = s.trim();
-      if (t === "") return true;
-      const stripped = t.replace(BOX_CHARS_G, "").trim();
-      return stripped === "" || /^[╭╮╰╯┌┐└┘┏┓┗┛]/.test(t);
-    };
-
-    // Claude Code TUI renders the input box (╭─╮ │>│ ╰─╯) plus a status
-    // footer ("? for shortcuts", model name, …) at the very bottom of the
-    // pane. Without skipping past the box's top edge, the trailing
-    // "trim box-or-empty" pass stops at the footer (plain text, not a box
-    // line) and we'd end up speaking the footer instead of the assistant's
-    // last reply. So: find the top edge of the most recent input box and
-    // treat everything from there downward as chrome.
-    let boxTop = -1;
-    for (let i = raw.length - 1; i >= 0; i--) {
+    let endIdx = raw.length;
+    for (let i = anchorIdx + 1; i < raw.length; i++) {
       if (BOX_TOP_CHARS.test(raw[i])) {
-        boxTop = i;
+        endIdx = i;
         break;
       }
     }
 
-    let end = boxTop >= 0 ? boxTop : raw.length;
-    while (end > 0 && isBoxOrEmpty(raw[end - 1])) end--;
-
-    let start = end;
-    for (let i = end - 1; i >= 0; i--) {
-      if (isBoxOrEmpty(raw[i])) {
-        start = i + 1;
-        break;
-      }
-      const t = raw[i].replace(BOX_CHARS_G, "").trim();
-      if (/^>\s/.test(t)) {
-        start = i + 1;
-        break;
-      }
-      start = i;
-    }
+    // Heuristics for lines we never want to read aloud, even if they sit
+    // between the anchor and the input box.
+    const isTmuxStatusBar = (s: string) => /^\s*\[[\w-]+:[\w-]+/.test(s);
+    const isShortcutFooter = (s: string) =>
+      /\?\s*for\s+shortcuts/i.test(s) || /esc\s*to\s*interrupt/i.test(s);
+    const isContinuationOfAnchor = (s: string) =>
+      // The Claude TUI may wrap the user prompt across two rows. Strip any
+      // row that's still part of our injected text.
+      s.includes(anchorHead);
 
     const cleaned = raw
-      .slice(start, end)
+      .slice(anchorIdx + 1, endIdx)
       .map((l) => l.replace(BOX_CHARS_G, "").replace(/^\s+|\s+$/g, ""))
-      .filter((l) => l !== "")
+      .filter(
+        (l) =>
+          l !== "" &&
+          !isTmuxStatusBar(l) &&
+          !isShortcutFooter(l) &&
+          !isContinuationOfAnchor(l),
+      )
       .join(" ");
 
-    return cleaned.slice(0, 1200);
+    return cleaned.slice(0, 4000);
   }, []);
 
-  const requestTranscriptBriefing = useCallback((): Promise<string | null> => {
-    const ws = wsRef.current;
-    if (!ws || ws.readyState !== WebSocket.OPEN) return Promise.resolve(null);
-    const prev = briefingPendingRef.current;
-    if (prev) {
-      clearTimeout(prev.timer);
-      prev.resolve(null);
-      briefingPendingRef.current = null;
-    }
-    return new Promise<string | null>((resolve) => {
-      const id =
-        (typeof crypto !== "undefined" && "randomUUID" in crypto
-          ? crypto.randomUUID()
-          : Math.random().toString(36).slice(2));
-      const timer = setTimeout(() => {
-        if (briefingPendingRef.current?.id === id) {
-          briefingPendingRef.current = null;
-          resolve(null);
-        }
-      }, 3000);
-      briefingPendingRef.current = { id, resolve, timer };
-      try {
-        ws.send(JSON.stringify({ type: "briefing", id }));
-      } catch {
-        clearTimeout(timer);
-        briefingPendingRef.current = null;
-        resolve(null);
-      }
-    });
-  }, []);
-
-  const speakText = useCallback((text: string) => {
-    const synth = window.speechSynthesis;
-    const utter = new SpeechSynthesisUtterance(text);
-    utter.lang = "ko-KR";
-    utter.rate = 1.05;
-    utter.onend = () => setSpeaking(false);
-    utter.onerror = () => setSpeaking(false);
-    setSpeaking(true);
-    synth.speak(utter);
-  }, []);
+  const playBase64Audio = useCallback(
+    (base64: string, mime: string): Promise<void> => {
+      stopBriefingAudio();
+      const bin = atob(base64);
+      const buf = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) buf[i] = bin.charCodeAt(i);
+      const blob = new Blob([buf], { type: mime });
+      const url = URL.createObjectURL(blob);
+      briefingAudioUrlRef.current = url;
+      const audio = new Audio(url);
+      briefingAudioRef.current = audio;
+      return new Promise<void>((resolve, reject) => {
+        audio.onended = () => {
+          stopBriefingAudio();
+          resolve();
+        };
+        audio.onerror = () => {
+          stopBriefingAudio();
+          reject(new Error("audio playback failed"));
+        };
+        audio.play().catch((err) => {
+          stopBriefingAudio();
+          reject(err);
+        });
+      });
+    },
+    [stopBriefingAudio],
+  );
 
   const toggleClaude = useCallback(async () => {
     if (claudeBusy) return;
@@ -558,38 +890,138 @@ export function Terminal({ name }: Props) {
   }, [claudeBusy, name, router]);
 
   const toggleBriefing = useCallback(async () => {
-    if (typeof window === "undefined" || !("speechSynthesis" in window)) {
-      setBanner("이 브라우저는 음성 합성을 지원하지 않습니다.");
+    if (briefingState === "playing") {
+      stopBriefingAudio();
+      setBriefingState("idle");
       return;
     }
-    const synth = window.speechSynthesis;
-    if (synth.speaking || synth.pending) {
-      synth.cancel();
-      setSpeaking(false);
+    if (briefingState === "loading") return;
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      setBanner("WebSocket이 연결되어 있지 않습니다.");
       return;
     }
 
-    const transcriptText = await requestTranscriptBriefing();
-    const text = transcriptText ?? extractLastAssistantText();
-    if (!text) {
-      setBanner("읽을 답변을 찾지 못했습니다.");
+    setBriefingState("loading");
+    setBanner("Claude에게 /btw 브리핑을 요청하는 중…");
+    const reasonMessages: Record<string, string> = {
+      claude_not_running: "이 세션에서 Claude Code가 실행 중이 아닙니다.",
+      no_api_key: "OPENROUTER_API_KEY가 설정되어 있지 않습니다.",
+      empty_text: "브리핑 응답을 추출하지 못했습니다.",
+    };
+
+    // Phase 1: ask the gateway to inject `/btw <prompt>` into the TUI.
+    const injectAt = Date.now();
+    const bytesAtInject = termBytesReceivedRef.current;
+    const inject = await sendBriefingRequest({ type: "briefing_inject" }, 15_000);
+    if (!inject) {
+      setBanner("브리핑 요청이 시간 초과되었습니다.");
+      setBriefingState("idle");
       return;
     }
-    speakText(text.slice(0, 4000));
-  }, [extractLastAssistantText, requestTranscriptBriefing, speakText]);
+    if (inject.type === "briefing_error") {
+      const reason = inject.reason ?? "error";
+      setBanner(reasonMessages[reason] ?? `브리핑 실패: ${reason}`);
+      setBriefingState("idle");
+      return;
+    }
+    if (inject.type !== "briefing_inject_ok") {
+      setBanner("예상치 못한 응답을 받았습니다.");
+      setBriefingState("idle");
+      return;
+    }
+
+    // Phase 2: wait until Claude's /btw answer has actually rendered and
+    // settled, then anchor on the echoed prompt to scrape the answer.
+    // /btw doesn't write to ~/.claude/projects/*.jsonl so the buffer is
+    // the only source of truth; we require ≥400 bytes of pty growth +
+    // 4 s of quiet so a brief pre-answer "thinking" pause can't be
+    // mistaken for completion.
+    setBanner("Claude의 답변을 기다리는 중…");
+    const settled = await waitForTerminalSettle(
+      injectAt,
+      bytesAtInject,
+      4_000,
+      90_000,
+      400,
+    );
+    // Use the head of the prompt the server actually injected as the
+    // anchor — the server echoes BRIEFING_PROMPT back in inject_ok so the
+    // two stay in lock-step even if we tweak the wording later.
+    const fullPrompt = inject.prompt ?? "";
+    const anchorHead = fullPrompt.slice(0, 14).trim() || fullPrompt;
+    const scraped = anchorHead ? extractAnswerAfterAnchor(anchorHead) : "";
+    if (typeof window !== "undefined") {
+      // eslint-disable-next-line no-console
+      console.info(
+        "[briefing] settled=%s anchorHead=%o scraped %d chars:\n%s",
+        settled,
+        anchorHead,
+        scraped.length,
+        scraped,
+      );
+    }
+    if (!scraped) {
+      setBanner(
+        settled
+          ? "브리핑 응답을 화면에서 찾지 못했습니다."
+          : "Claude 답변을 시간 내에 받지 못했습니다.",
+      );
+      setBriefingState("idle");
+      return;
+    }
+
+    // Phase 3: synthesize via OpenRouter on the gateway.
+    setBanner("음성 합성 중…");
+    const synth = await sendBriefingRequest(
+      { type: "briefing_synth", text: scraped },
+      120_000,
+    );
+    if (!synth) {
+      setBanner("음성 합성이 시간 초과되었습니다.");
+      setBriefingState("idle");
+      return;
+    }
+    if (synth.type === "briefing_error") {
+      const reason = synth.reason ?? "error";
+      setBanner(reasonMessages[reason] ?? `음성 합성 실패: ${reason}`);
+      setBriefingState("idle");
+      return;
+    }
+    if (synth.type !== "briefing_audio") {
+      setBanner("예상치 못한 응답을 받았습니다.");
+      setBriefingState("idle");
+      return;
+    }
+
+    setBanner(null);
+    setBriefingState("playing");
+    try {
+      await playBase64Audio(synth.audio, synth.mime || "audio/wav");
+    } catch {
+      setBanner("음성 재생에 실패했습니다.");
+    } finally {
+      setBriefingState("idle");
+    }
+  }, [
+    briefingState,
+    extractAnswerAfterAnchor,
+    playBase64Audio,
+    sendBriefingRequest,
+    stopBriefingAudio,
+    waitForTerminalSettle,
+  ]);
 
   useEffect(() => {
     return () => {
-      if (typeof window !== "undefined" && "speechSynthesis" in window) {
-        window.speechSynthesis.cancel();
-      }
+      stopBriefingAudio();
       const pending = briefingPendingRef.current;
       if (pending) {
         clearTimeout(pending.timer);
         briefingPendingRef.current = null;
       }
     };
-  }, []);
+  }, [stopBriefingAudio]);
 
   const focusIfKeyboardLikelyVisible = useCallback(() => {
     // On mobile, calling term.focus() steals focus to xterm's hidden
@@ -655,10 +1087,22 @@ export function Terminal({ name }: Props) {
         <span className="spacer" />
         <button
           onClick={toggleBriefing}
-          title={speaking ? "음성 정지" : "마지막 답변 음성 브리핑"}
-          aria-pressed={speaking}
+          disabled={briefingState === "loading"}
+          aria-busy={briefingState === "loading"}
+          aria-pressed={briefingState === "playing"}
+          title={
+            briefingState === "playing"
+              ? "음성 정지"
+              : briefingState === "loading"
+                ? "Claude 브리핑 준비 중…"
+                : "Claude에게 대화 브리핑을 요청하고 음성으로 들려줍니다"
+          }
         >
-          {speaking ? "⏹ 정지" : "🔊 브리핑"}
+          {briefingState === "playing"
+            ? "⏹ 정지"
+            : briefingState === "loading"
+              ? "⏳ 브리핑…"
+              : "🔊 브리핑"}
         </button>
         <button
           onClick={toggleClaude}

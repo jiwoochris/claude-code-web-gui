@@ -3,6 +3,41 @@
 import { useEffect, useRef, useState } from "react";
 import dynamic from "next/dynamic";
 
+const PdfCanvasViewer = dynamic(
+  () => import("./PdfCanvasViewer").then((m) => m.PdfCanvasViewer),
+  { ssr: false, loading: () => <div className="fv-loading">PDF 불러오는 중…</div> },
+);
+
+const MarkdownViewer = dynamic(
+  () => import("./MarkdownViewer").then((m) => m.MarkdownViewer),
+  { ssr: false, loading: () => <div className="fv-loading">마크다운 렌더링…</div> },
+);
+
+function isMarkdownPath(p: string | null): boolean {
+  if (!p) return false;
+  const lower = p.toLowerCase();
+  return lower.endsWith(".md") || lower.endsWith(".mdx") || lower.endsWith(".markdown");
+}
+
+export function isHtmlPath(p: string | null): boolean {
+  if (!p) return false;
+  const lower = p.toLowerCase();
+  return lower.endsWith(".html") || lower.endsWith(".htm");
+}
+
+function useIsTouchDevice(): boolean {
+  const [touch, setTouch] = useState(false);
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const mq = window.matchMedia("(pointer: coarse)");
+    const update = () => setTouch(mq.matches);
+    update();
+    mq.addEventListener?.("change", update);
+    return () => mq.removeEventListener?.("change", update);
+  }, []);
+  return touch;
+}
+
 const MonacoEditor = dynamic(async () => {
   // Silence Monaco's worker warning. Read-only previews don't need language
   // workers; the fallback tokenizes on the main thread, which is fine here.
@@ -80,18 +115,33 @@ export type PreviewState =
   | { kind: "loading"; path: string }
   | { kind: "text"; path: string; content: string }
   | { kind: "image"; path: string; src: string; mime: string }
-  | { kind: "pdf"; path: string; src: string; renderedFromOffice: boolean }
+  | {
+      kind: "pdf";
+      path: string;
+      src: string;
+      renderedFromOffice: boolean;
+      sourceExt?: string;
+      notes?: string[];
+    }
   | { kind: "unavailable"; path: string; reason: "too_large" | "binary"; size: number; mime: string }
   | { kind: "error"; path: string; message: string };
 
 interface Props {
   state: PreviewState;
   onDownload: (path: string) => void;
+  markdownRaw?: boolean;
+  htmlRaw?: boolean;
 }
 
-export function FileViewer({ state, onDownload }: Props) {
+export function FileViewer({
+  state,
+  onDownload,
+  markdownRaw = false,
+  htmlRaw = false,
+}: Props) {
   const [mounted, setMounted] = useState(false);
   const hostRef = useRef<HTMLDivElement>(null);
+  const isTouch = useIsTouchDevice();
 
   useEffect(() => {
     setMounted(true);
@@ -121,33 +171,21 @@ export function FileViewer({ state, onDownload }: Props) {
   }
 
   if (state.kind === "pdf") {
+    // For pptx renders we always use the canvas viewer so per-slide speaker
+    // notes can be inlined under each page. Other PDFs keep the native
+    // browser viewer on desktop for its zoom/search controls.
+    const useCanvas = isTouch || state.sourceExt === "pptx";
     return (
       <div className="fv-pdf">
-        <div className="fv-toolbar">
-          <span className="path" title={state.path}>{state.path}</span>
-          {state.renderedFromOffice ? (
-            <span className="fv-tag" title="LibreOffice가 PDF로 변환한 미리보기">
-              PDF로 변환됨
-            </span>
-          ) : null}
-          <span className="spacer" />
-          <a
-            className="btn"
-            href={state.src}
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            ↗ 새 탭
-          </a>
-          <button className="btn" onClick={() => onDownload(state.path)}>
-            ⬇ 다운로드
-          </button>
-        </div>
-        <iframe
-          className="fv-pdf-frame"
-          src={state.src}
-          title={state.path}
-        />
+        {useCanvas ? (
+          <PdfCanvasViewer src={state.src} notes={state.notes} />
+        ) : (
+          <iframe
+            className="fv-pdf-frame"
+            src={state.src}
+            title={state.path}
+          />
+        )}
       </div>
     );
   }
@@ -185,15 +223,27 @@ export function FileViewer({ state, onDownload }: Props) {
   }
 
   // text
+  const isMd = isMarkdownPath(state.path);
+  const isHtml = isHtmlPath(state.path);
   return (
     <div className="fv-text">
-      <div className="fv-toolbar">
-        <span className="path" title={state.path}>{state.path}</span>
-        <span className="spacer" />
-        <button className="btn" onClick={() => onDownload(state.path)}>
-          ⬇ 다운로드
-        </button>
-      </div>
+      {isMd && !markdownRaw ? (
+        <div className="fv-md-host">
+          <MarkdownViewer source={state.content} basePath={state.path} />
+        </div>
+      ) : isHtml && !htmlRaw ? (
+        <iframe
+          className="fv-html-frame"
+          title={state.path}
+          srcDoc={state.content}
+          // No allow-same-origin: scripts run, but the iframe is a null
+          // origin and can't read this app's cookies/storage. allow-popups
+          // lets target=_blank links work; allow-forms lets demo forms
+          // submit to their own action URL.
+          sandbox="allow-scripts allow-popups allow-forms"
+          referrerPolicy="no-referrer"
+        />
+      ) : (
       <div ref={hostRef} className="fv-editor-host">
         {mounted ? (
           <MonacoEditor
@@ -238,6 +288,7 @@ export function FileViewer({ state, onDownload }: Props) {
           />
         ) : null}
       </div>
+      )}
     </div>
   );
 }

@@ -14,6 +14,13 @@ import type { PreviewState } from "./FileViewer";
 
 type TreeResponse = { path: string; rootName: string; entries: Entry[] };
 
+export interface UploadProgress {
+  total: number;
+  done: number;
+  active: string | null;
+  errors: { name: string; message: string }[];
+}
+
 interface FilesContextValue {
   rootName: string;
   trees: Map<string, Entry[]>;
@@ -21,16 +28,30 @@ interface FilesContextValue {
   expanded: Set<string>;
   selected: string | null;
   preview: PreviewState;
+  recentFiles: string[];
   watchOk: boolean;
   topError: string | null;
+  upload: UploadProgress | null;
 
   toggleFolder: (relPath: string) => Promise<void>;
   selectFile: (relPath: string) => Promise<void>;
   closeFile: () => void;
+  closeRecent: (relPath: string) => void;
+  reloadCurrent: () => Promise<void>;
   navigateTo: (relPath: string) => Promise<void>;
   refreshTree: (relPath: string) => Promise<void>;
+  refreshAll: () => Promise<void>;
   download: (relPath: string) => void;
+  uploadFiles: (
+    targetDir: string,
+    files: File[] | FileList,
+  ) => Promise<{ uploaded: number; failed: number }>;
+  resolveDropTarget: (path: string) => string;
 }
+
+const RECENT_FILES_LIMIT = 5;
+const RECENT_FILES_STORAGE_KEY = "files-recent:v1";
+const SELECTED_FILE_STORAGE_KEY = "files-selected:v1";
 
 const FilesContext = createContext<FilesContextValue | null>(null);
 
@@ -47,15 +68,23 @@ export function FilesProvider({ children }: { children: React.ReactNode }) {
   const [loading, setLoading] = useState<Set<string>>(() => new Set());
   const [selected, setSelected] = useState<string | null>(null);
   const [preview, setPreview] = useState<PreviewState>({ kind: "empty" });
+  const [recentFiles, setRecentFiles] = useState<string[]>([]);
   const [connId, setConnId] = useState<string | null>(null);
   const [watchOk, setWatchOk] = useState(false);
   const [topError, setTopError] = useState<string | null>(null);
+  const [upload, setUpload] = useState<UploadProgress | null>(null);
 
   const connIdRef = useRef<string | null>(null);
   const selectedRef = useRef<string | null>(null);
   const expandedRef = useRef<Set<string>>(new Set([""]));
   const treesRef = useRef<Map<string, Entry[]>>(new Map());
   const imageUrlRef = useRef<string | null>(null);
+  const recentFilesRef = useRef<string[]>([]);
+  const recentHydratedRef = useRef(false);
+  // Bumped whenever the iframe-rendered preview should bypass its cache
+  // (manual reload + SSE change). Appended as &v=N to PDF/render URLs so
+  // the browser actually re-fetches instead of reusing the cached blob.
+  const reloadTickRef = useRef(0);
 
   useEffect(() => {
     connIdRef.current = connId;
@@ -69,6 +98,62 @@ export function FilesProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     treesRef.current = trees;
   }, [trees]);
+  useEffect(() => {
+    recentFilesRef.current = recentFiles;
+  }, [recentFiles]);
+
+  // Hydrate recent files + last-viewed file path from localStorage once on
+  // mount. The actual reopen of the selected file happens in a later effect
+  // (after openFile is declared) to avoid a TDZ on the useCallback.
+  const pendingSelectedRef = useRef<string | null>(null);
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(RECENT_FILES_STORAGE_KEY);
+      if (raw) {
+        const arr = JSON.parse(raw) as unknown;
+        if (Array.isArray(arr)) {
+          const clean = arr
+            .filter((v): v is string => typeof v === "string" && v.length > 0)
+            .slice(0, RECENT_FILES_LIMIT);
+          if (clean.length > 0) setRecentFiles(clean);
+        }
+      }
+      const sel = localStorage.getItem(SELECTED_FILE_STORAGE_KEY);
+      if (sel && typeof sel === "string" && sel.length > 0) {
+        pendingSelectedRef.current = sel;
+      }
+    } catch {
+      /* ignore */
+    }
+    recentHydratedRef.current = true;
+  }, []);
+
+  // Persist recent files + selected after hydration so initial mount doesn't
+  // clobber stored values with empty defaults.
+  useEffect(() => {
+    if (!recentHydratedRef.current) return;
+    try {
+      localStorage.setItem(
+        RECENT_FILES_STORAGE_KEY,
+        JSON.stringify(recentFiles),
+      );
+    } catch {
+      /* ignore */
+    }
+  }, [recentFiles]);
+
+  useEffect(() => {
+    if (!recentHydratedRef.current) return;
+    try {
+      if (selected) {
+        localStorage.setItem(SELECTED_FILE_STORAGE_KEY, selected);
+      } else {
+        localStorage.removeItem(SELECTED_FILE_STORAGE_KEY);
+      }
+    } catch {
+      /* ignore */
+    }
+  }, [selected]);
 
   const markLoading = useCallback((p: string, on: boolean) => {
     setLoading((prev) => {
@@ -154,12 +239,17 @@ export function FilesProvider({ children }: { children: React.ReactNode }) {
       "rtf",
     ]);
 
+    const tickQs = reloadTickRef.current
+      ? `&v=${reloadTickRef.current}`
+      : "";
+
     if (PDF_EXTS.has(ext)) {
       setPreview({
         kind: "pdf",
         path: relPath,
-        src: `/api/fs/file?path=${encodeURIComponent(relPath)}`,
+        src: `/api/fs/file?path=${encodeURIComponent(relPath)}${tickQs}`,
         renderedFromOffice: false,
+        sourceExt: "pdf",
       });
       return;
     }
@@ -169,7 +259,7 @@ export function FilesProvider({ children }: { children: React.ReactNode }) {
       // download the source file.
       try {
         const probe = await fetch(
-          `/api/fs/render?path=${encodeURIComponent(relPath)}`,
+          `/api/fs/render?path=${encodeURIComponent(relPath)}${tickQs}`,
           { method: "HEAD", credentials: "include" },
         );
         if (probe.status === 401) {
@@ -180,9 +270,35 @@ export function FilesProvider({ children }: { children: React.ReactNode }) {
           setPreview({
             kind: "pdf",
             path: relPath,
-            src: `/api/fs/render?path=${encodeURIComponent(relPath)}`,
+            src: `/api/fs/render?path=${encodeURIComponent(relPath)}${tickQs}`,
             renderedFromOffice: true,
+            sourceExt: ext,
           });
+          if (ext === "pptx") {
+            // Fetch speaker notes asynchronously and merge into the preview
+            // when they arrive. The PDF itself is usable without notes, so
+            // any failure here is silent.
+            void fetch(
+              `/api/fs/pptx-notes?path=${encodeURIComponent(relPath)}`,
+              { credentials: "include" },
+            )
+              .then(async (r) => {
+                if (!r.ok) return null;
+                return (await r.json()) as { notes: string[] };
+              })
+              .then((data) => {
+                if (!data) return;
+                if (selectedRef.current !== relPath) return;
+                setPreview((prev) =>
+                  prev.kind === "pdf" && prev.path === relPath
+                    ? { ...prev, notes: data.notes }
+                    : prev,
+                );
+              })
+              .catch(() => {
+                /* notes are best-effort */
+              });
+          }
           return;
         }
         if (probe.status === 503) {
@@ -212,8 +328,8 @@ export function FilesProvider({ children }: { children: React.ReactNode }) {
 
     try {
       const res = await fetch(
-        `/api/fs/file?path=${encodeURIComponent(relPath)}`,
-        { credentials: "include" },
+        `/api/fs/file?path=${encodeURIComponent(relPath)}${tickQs}`,
+        { credentials: "include", cache: "no-store" },
       );
       if (res.status === 401) {
         window.location.href = "/login";
@@ -247,26 +363,78 @@ export function FilesProvider({ children }: { children: React.ReactNode }) {
     }
   }, []);
 
+  // After the hydration effect has stashed the previously-viewed path,
+  // reopen it. We use openFile (not selectFile) so the recent-files order
+  // captured from localStorage is preserved as-is.
+  useEffect(() => {
+    const path = pendingSelectedRef.current;
+    if (!path) return;
+    pendingSelectedRef.current = null;
+    void openFile(path);
+  }, [openFile]);
+
   const selectFile = useCallback(
     async (relPath: string) => {
       const prev = selectedRef.current;
       if (prev && prev !== relPath) subscribeWatch(prev, "file", "remove");
+      setRecentFiles((list) => {
+        const filtered = list.filter((p) => p !== relPath);
+        return [relPath, ...filtered].slice(0, RECENT_FILES_LIMIT);
+      });
       await openFile(relPath);
       subscribeWatch(relPath, "file", "add");
     },
     [openFile, subscribeWatch],
   );
 
+  // Removes `path` from the recent list. If it was the active file, switch to
+  // a neighboring tab (the one that takes its index) or fall back to empty.
+  const closeRecent = useCallback(
+    (path: string) => {
+      const list = recentFilesRef.current;
+      const idx = list.indexOf(path);
+      if (idx < 0) return;
+      const remaining = list.filter((p) => p !== path);
+      setRecentFiles(remaining);
+      if (selectedRef.current !== path) return;
+      subscribeWatch(path, "file", "remove");
+      if (imageUrlRef.current) {
+        URL.revokeObjectURL(imageUrlRef.current);
+        imageUrlRef.current = null;
+      }
+      if (remaining.length === 0) {
+        setSelected(null);
+        setPreview({ kind: "empty" });
+        return;
+      }
+      const nextIdx = Math.min(idx, remaining.length - 1);
+      const next = remaining[nextIdx];
+      void openFile(next);
+      subscribeWatch(next, "file", "add");
+    },
+    [openFile, subscribeWatch],
+  );
+
+  const reloadCurrent = useCallback(async () => {
+    const cur = selectedRef.current;
+    if (!cur) return;
+    reloadTickRef.current += 1;
+    await openFile(cur);
+  }, [openFile]);
+
   const closeFile = useCallback(() => {
-    const prev = selectedRef.current;
-    if (prev) subscribeWatch(prev, "file", "remove");
+    const cur = selectedRef.current;
+    if (cur) {
+      closeRecent(cur);
+      return;
+    }
     if (imageUrlRef.current) {
       URL.revokeObjectURL(imageUrlRef.current);
       imageUrlRef.current = null;
     }
     setSelected(null);
     setPreview({ kind: "empty" });
-  }, [subscribeWatch]);
+  }, [closeRecent]);
 
   const toggleFolder = useCallback(
     async (relPath: string) => {
@@ -319,10 +487,105 @@ export function FilesProvider({ children }: { children: React.ReactNode }) {
     [fetchTree, subscribeWatch],
   );
 
+  // Re-fetch every currently expanded folder so newly created or removed
+  // entries show up even if the SSE watcher missed them (e.g. files added
+  // by an external process while the watcher was disconnected).
+  const refreshAll = useCallback(async () => {
+    const paths = Array.from(expandedRef.current);
+    await Promise.all(paths.map((p) => fetchTree(p).catch(() => null)));
+  }, [fetchTree]);
+
   const download = useCallback((relPath: string) => {
     const url = `/api/fs/download?path=${encodeURIComponent(relPath)}`;
     window.location.href = url;
   }, []);
+
+  // Given a tree path (file or folder), figure out which folder an upload
+  // should land in. Caller passes whatever the user dropped onto.
+  const resolveDropTarget = useCallback((p: string): string => {
+    if (!p) return "";
+    if (treesRef.current.has(p)) return p; // known directory
+    const slash = p.lastIndexOf("/");
+    return slash < 0 ? "" : p.slice(0, slash);
+  }, []);
+
+  const uploadFiles = useCallback(
+    async (targetDir: string, input: File[] | FileList) => {
+      const files: File[] = Array.from(input as ArrayLike<File>).filter(
+        (f) => f && typeof f === "object" && "size" in f,
+      );
+      if (files.length === 0) return { uploaded: 0, failed: 0 };
+
+      setUpload({
+        total: files.length,
+        done: 0,
+        active: files[0]?.name ?? null,
+        errors: [],
+      });
+
+      let uploaded = 0;
+      const errors: { name: string; message: string }[] = [];
+      // Send sequentially so progress is meaningful and we don't blast a
+      // whole drop of dozens of files at the server in parallel.
+      for (let i = 0; i < files.length; i++) {
+        const f = files[i];
+        setUpload((prev) =>
+          prev
+            ? { ...prev, active: f.name, done: i }
+            : prev,
+        );
+        try {
+          const fd = new FormData();
+          fd.append("path", targetDir);
+          fd.append("file", f, f.name);
+          const res = await fetch("/api/fs/upload", {
+            method: "POST",
+            body: fd,
+            credentials: "include",
+          });
+          if (res.status === 401) {
+            window.location.href = "/login";
+            return { uploaded, failed: errors.length + (files.length - i) };
+          }
+          if (!res.ok) {
+            const text = await res.text().catch(() => "");
+            errors.push({
+              name: f.name,
+              message: text || `HTTP ${res.status}`,
+            });
+          } else {
+            uploaded++;
+          }
+        } catch (e) {
+          errors.push({ name: f.name, message: (e as Error).message });
+        }
+      }
+
+      // Refresh the destination tree so the new files appear immediately
+      // even if the SSE watcher is slow or disconnected.
+      await fetchTree(targetDir).catch(() => null);
+
+      setUpload({
+        total: files.length,
+        done: files.length,
+        active: null,
+        errors,
+      });
+      // Auto-clear the toast a few seconds after a clean run.
+      if (errors.length === 0) {
+        setTimeout(() => setUpload(null), 2500);
+      }
+      if (errors.length > 0) {
+        setTopError(
+          `업로드 실패 ${errors.length}건 — ${errors[0].name}: ${errors[0].message}`,
+        );
+      } else {
+        setTopError(null);
+      }
+      return { uploaded, failed: errors.length };
+    },
+    [fetchTree],
+  );
 
   // Initial root tree load.
   useEffect(() => {
@@ -352,6 +615,9 @@ export function FilesProvider({ children }: { children: React.ReactNode }) {
         const changed = data.path;
         const sel = selectedRef.current;
         if (sel && sel === changed && (data.type === "change" || data.type === "add")) {
+          // Bump cache-buster so iframe-rendered previews (PDF/PPTX/etc)
+          // actually re-fetch instead of reusing the cached blob.
+          reloadTickRef.current += 1;
           openFile(sel);
         }
         const lastSlash = changed.lastIndexOf("/");
@@ -399,16 +665,23 @@ export function FilesProvider({ children }: { children: React.ReactNode }) {
       expanded,
       selected,
       preview,
+      recentFiles,
       watchOk,
       topError,
+      upload,
       toggleFolder,
       selectFile,
       closeFile,
+      closeRecent,
+      reloadCurrent,
       navigateTo,
       refreshTree: async (p: string) => {
         await fetchTree(p);
       },
+      refreshAll,
       download,
+      uploadFiles,
+      resolveDropTarget,
     }),
     [
       rootName,
@@ -417,14 +690,21 @@ export function FilesProvider({ children }: { children: React.ReactNode }) {
       expanded,
       selected,
       preview,
+      recentFiles,
       watchOk,
       topError,
+      upload,
       toggleFolder,
       selectFile,
       closeFile,
+      closeRecent,
+      reloadCurrent,
       navigateTo,
       fetchTree,
+      refreshAll,
       download,
+      uploadFiles,
+      resolveDropTarget,
     ],
   );
 

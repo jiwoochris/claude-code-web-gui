@@ -1,8 +1,8 @@
 import http from "node:http";
-import { execFile } from "node:child_process";
-import fs from "node:fs/promises";
+import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { WebSocketServer, type WebSocket } from "ws";
 import * as pty from "node-pty";
@@ -28,6 +28,9 @@ const PING_INTERVAL_MS = 30_000;
 // ──────────────────────────────────────────────────────────────
 
 const SESSION_SECRET = process.env.SESSION_SECRET;
+const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY ?? "";
+const OPENROUTER_TTS_MODEL = process.env.OPENROUTER_TTS_MODEL ?? "openai/gpt-audio";
+const OPENROUTER_TTS_VOICE = process.env.OPENROUTER_TTS_VOICE ?? "alloy";
 if (!SESSION_SECRET || SESSION_SECRET.length < 32) {
   console.error(
     JSON.stringify({
@@ -37,6 +40,44 @@ if (!SESSION_SECRET || SESSION_SECRET.length < 32) {
     }),
   );
   process.exit(1);
+}
+
+// Force tmux server-wide options the webgui depends on:
+//   - extended-keys always:           always forward CSI u modified-key
+//                                     sequences to inner panes (the default
+//                                     `on` only forwards when the app DECSETs
+//                                     extended keys, which Claude Code may
+//                                     not do early enough)
+//   - extended-keys-format csi-u:     keep the wire format as ESC[13;2u
+//                                     instead of tmux's default xterm
+//                                     `ESC[27;2;13~`, which Claude Code's
+//                                     input parser does NOT treat as
+//                                     Shift+Enter
+//   - terminal-features extkeys:      declare CSI u capability on tmux's
+//                                     outer xterm-256color terminfo entry
+// Without all three, the browser's ESC[13;2u for Shift+Enter is dropped or
+// rewritten by tmux and Claude Code only sees a bare CR (== submit).
+// Idempotent and silent on failure — if tmux isn't reachable yet there's
+// nothing to configure.
+async function ensureTmuxExtendedKeys(): Promise<void> {
+  try {
+    await execFileP("tmux", ["set-option", "-g", "extended-keys", "always"]);
+    await execFileP("tmux", [
+      "set-option",
+      "-g",
+      "extended-keys-format",
+      "csi-u",
+    ]);
+    await execFileP("tmux", [
+      "set-option",
+      "-gas",
+      "terminal-features",
+      "xterm*:extkeys",
+    ]);
+  } catch {
+    /* tmux server may not be running yet; the next tmux invocation will
+       inherit options from ~/.tmux.conf when the server actually starts */
+  }
 }
 
 function log(level: "info" | "warn" | "error", event: string, extra?: Record<string, unknown>) {
@@ -82,126 +123,247 @@ const server = http.createServer((req, res) => {
   res.end("Not Found");
 });
 
-// ── Claude Code transcript briefing ───────────────────────────
-// Resolve the assistant's most recent text turn for `sessionName` by:
-//   1. Asking tmux for the pane's current working directory.
-//   2. Translating that cwd into Claude's project-encoded directory under
-//      ~/.claude/projects/ (Claude replaces "/" with "-" verbatim).
-//   3. Reading the most recently modified .jsonl in that directory and
-//      walking it backward for the last `assistant` message with text content.
-// Returns null when any step fails — the UI falls back to the terminal scrape.
-const CLAUDE_PROJECTS_DIR = path.join(
-  process.env.CLAUDE_PROJECTS_DIR ?? path.join(os.homedir(), ".claude", "projects"),
-);
+// ── Claude Code briefing ──────────────────────────────────────
+// /btw is a Claude Code "side question" — it answers without polluting the
+// main thread's context, and it does NOT write its turn to the project
+// transcript .jsonl. Briefing therefore runs as a two-phase exchange with
+// the UI:
+//   1. UI → "briefing_inject" → ws-gateway injects `/btw <prompt>` via
+//      tmux send-keys; the response is rendered only into the Claude TUI.
+//   2. UI watches its own xterm buffer for the response to settle, scrapes
+//      the assistant text out, and sends it back via "briefing_synth".
+//   3. ws-gateway streams the text through OpenRouter openai/gpt-audio
+//      (pcm16, stream:true) and ships back base64 WAV as "briefing_audio".
 
-async function tmuxPanePath(sessionName: string): Promise<string | null> {
+// Sent verbatim after `/btw `. Kept short because (a) /btw answers from
+// existing context anyway and (b) the UI uses the prompt's distinctive head
+// as a textual anchor when scraping the response out of the xterm buffer —
+// shorter and more recognizable means the anchor scan is more reliable.
+const BRIEFING_SIDE_COMMAND = "/btw";
+const BRIEFING_PROMPT = "넌 내 비서야. 내 마지막 요청과 너의 작업 및 대화를 말하듯이 정리해줘.";
+
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+async function tmuxSendKeys(sessionName: string, ...keys: string[]): Promise<void> {
+  await execFileP("tmux", ["send-keys", "-t", sessionName, ...keys]);
+}
+
+// `tmux send-keys -l` treats every argument as literal text — no key-name
+// parsing. Required for prompts containing multibyte chars or characters
+// that happen to overlap tmux's key-name tokens (e.g. "Enter" inside a
+// sentence). The Enter that submits the prompt must be sent as a *separate*
+// send-keys call without -l so tmux interprets it as the Enter key.
+async function tmuxSendLiteral(sessionName: string, text: string): Promise<void> {
+  await execFileP("tmux", ["send-keys", "-t", sessionName, "-l", text]);
+}
+
+async function tmuxPaneCommand(sessionName: string): Promise<string | null> {
   try {
     const { stdout } = await execFileP("tmux", [
       "display-message",
       "-p",
       "-t",
       sessionName,
-      "#{pane_current_path}",
+      "#{pane_current_command}",
     ]);
-    const p = stdout.trim();
-    return p.length > 0 ? p : null;
+    const cmd = stdout.trim();
+    return cmd.length > 0 ? cmd : null;
   } catch {
     return null;
   }
 }
 
-function encodeProjectDir(cwd: string): string {
-  // Claude Code's encoding: replace every "/" with "-". A leading "/"
-  // therefore becomes a leading "-", matching the on-disk layout.
-  return cwd.replace(/\//g, "-");
+// Inject a fresh `/btw <prompt>` into the Claude TUI. Mirrors the /clear
+// path in the UI's claude API route — Esc cancels any in-flight stream /
+// clears partial input, C-u drains the readline buffer, a short pause lets
+// the input box re-render, then we send the literal text and Enter as two
+// distinct send-keys calls so the multibyte payload doesn't trip tmux's
+// key-name parser.
+async function injectBriefingPrompt(sessionName: string): Promise<void> {
+  await tmuxSendKeys(sessionName, "Escape");
+  await tmuxSendKeys(sessionName, "C-u");
+  await sleep(150);
+  await tmuxSendLiteral(sessionName, `${BRIEFING_SIDE_COMMAND} ${BRIEFING_PROMPT}`);
+  await sleep(80);
+  await tmuxSendKeys(sessionName, "Enter");
 }
 
-async function findLatestJsonl(projectDir: string): Promise<string | null> {
-  let entries: string[];
+interface BriefingAudio {
+  audio: string; // base64
+  mime: string;
+  text: string;
+}
+
+// OpenRouter's openai/gpt-audio rejects non-streaming requests
+// ("Audio output requires stream: true") AND restricts the streaming format
+// to pcm16 ("does not support 'mp3' when stream=true"). So we always stream
+// and reassemble PCM16 chunks ourselves, then wrap them in a WAV header for
+// the browser. OpenAI's gpt-4o audio output is fixed at 24 kHz / 16-bit /
+// mono, which matches what OpenRouter forwards.
+const OPENROUTER_PCM_SAMPLE_RATE = 24_000;
+const OPENROUTER_PCM_CHANNELS = 1;
+const OPENROUTER_PCM_BITS = 16;
+const OPENROUTER_FETCH_TIMEOUT_MS = 90_000;
+
+function wrapPcm16AsWav(pcm: Buffer): Buffer {
+  const channels = OPENROUTER_PCM_CHANNELS;
+  const sampleRate = OPENROUTER_PCM_SAMPLE_RATE;
+  const bitsPerSample = OPENROUTER_PCM_BITS;
+  const byteRate = (sampleRate * channels * bitsPerSample) / 8;
+  const blockAlign = (channels * bitsPerSample) / 8;
+  const header = Buffer.alloc(44);
+  header.write("RIFF", 0);
+  header.writeUInt32LE(36 + pcm.length, 4);
+  header.write("WAVE", 8);
+  header.write("fmt ", 12);
+  header.writeUInt32LE(16, 16);
+  header.writeUInt16LE(1, 20);
+  header.writeUInt16LE(channels, 22);
+  header.writeUInt32LE(sampleRate, 24);
+  header.writeUInt32LE(byteRate, 28);
+  header.writeUInt16LE(blockAlign, 32);
+  header.writeUInt16LE(bitsPerSample, 34);
+  header.write("data", 36);
+  header.writeUInt32LE(pcm.length, 40);
+  return Buffer.concat([header, pcm]);
+}
+
+async function synthesizeViaOpenRouter(text: string): Promise<BriefingAudio> {
+  if (!OPENROUTER_API_KEY) {
+    throw new Error("OPENROUTER_API_KEY not configured");
+  }
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), OPENROUTER_FETCH_TIMEOUT_MS);
+  let res: Response;
   try {
-    entries = await fs.readdir(projectDir);
-  } catch {
-    return null;
+    res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+      method: "POST",
+      signal: controller.signal,
+      headers: {
+        Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: OPENROUTER_TTS_MODEL,
+        modalities: ["text", "audio"],
+        audio: { voice: OPENROUTER_TTS_VOICE, format: "pcm16" },
+        stream: true,
+        messages: [
+          {
+            role: "system",
+            content:
+              "Read the user message aloud verbatim in Korean. Do not reorganize, summarize, paraphrase, reorder, shorten, or expand it — speak the exact wording as written. Strip only what cannot be spoken: markdown syntax (asterisks, backticks, hashes, brackets), bullet markers, code-block fences, and emoji. Keep the words, sentences, and order of the source intact. Do not add greetings, intros, outros, opinions, or commentary. Output Korean speech only.",
+          },
+          { role: "user", content: text },
+        ],
+      }),
+    });
+  } catch (err) {
+    clearTimeout(timeoutId);
+    throw err;
   }
-  let bestPath: string | null = null;
-  let bestMtime = -Infinity;
-  for (const name of entries) {
-    if (!name.endsWith(".jsonl")) continue;
-    const full = path.join(projectDir, name);
-    try {
-      const st = await fs.stat(full);
-      if (!st.isFile()) continue;
-      if (st.mtimeMs > bestMtime) {
-        bestMtime = st.mtimeMs;
-        bestPath = full;
+  if (!res.ok || !res.body) {
+    clearTimeout(timeoutId);
+    const body = await res.text().catch(() => "");
+    throw new Error(`openrouter ${res.status}: ${body.slice(0, 300)}`);
+  }
+
+  const decoder = new TextDecoder();
+  const pcmChunks: Buffer[] = [];
+  let sseBuf = "";
+  let providerError: string | null = null;
+  try {
+    for await (const chunk of res.body as unknown as AsyncIterable<Uint8Array>) {
+      sseBuf += decoder.decode(chunk, { stream: true });
+      const lines = sseBuf.split("\n");
+      sseBuf = lines.pop() ?? "";
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed.startsWith("data:")) continue;
+        const payload = trimmed.slice(5).trimStart();
+        if (!payload || payload === "[DONE]") continue;
+        let obj: {
+          error?: { message?: string };
+          choices?: Array<{
+            delta?: { audio?: { data?: string } };
+          }>;
+        };
+        try {
+          obj = JSON.parse(payload);
+        } catch {
+          continue;
+        }
+        if (obj.error?.message) {
+          providerError = obj.error.message;
+          continue;
+        }
+        const data = obj.choices?.[0]?.delta?.audio?.data;
+        if (typeof data === "string" && data.length > 0) {
+          pcmChunks.push(Buffer.from(data, "base64"));
+        }
       }
-    } catch {
-      /* ignore */
     }
+  } finally {
+    clearTimeout(timeoutId);
   }
-  return bestPath;
+
+  if (providerError && pcmChunks.length === 0) {
+    throw new Error(`openrouter provider: ${providerError}`);
+  }
+  if (pcmChunks.length === 0) {
+    throw new Error("openrouter response had no audio data");
+  }
+  const wav = wrapPcm16AsWav(Buffer.concat(pcmChunks));
+  return { audio: wav.toString("base64"), mime: "audio/wav", text };
 }
 
-type AssistantContent =
-  | { type: "text"; text?: string }
-  | { type: string; [k: string]: unknown };
+interface BriefingInjectResult {
+  ok: boolean;
+  reason?: string;
+}
 
-function extractAssistantText(line: string): string | null {
-  let obj: {
-    message?: {
-      type?: string;
-      role?: string;
-      content?: AssistantContent[] | string;
-    };
-  };
+async function runBriefingInject(sessionName: string): Promise<BriefingInjectResult> {
+  // tmux's `pane_current_command` reports the *name* of the foreground proc,
+  // which on macOS comes from p_comm. Claude Code sets its proc name to its
+  // version string (e.g. "2.1.133"), so we cannot match on "claude"/"node"
+  // directly. Mirror the UI's isShellCommand logic instead — if the pane is
+  // running anything other than a known shell, we assume Claude is up.
+  const SHELL_NAMES = new Set([
+    "bash", "zsh", "sh", "fish", "dash", "ash", "ksh", "tcsh", "csh",
+    "nu", "pwsh", "powershell",
+  ]);
+  const rawPaneCmd = (await tmuxPaneCommand(sessionName)) ?? "";
+  const paneCmd = rawPaneCmd.replace(/^-/, "").toLowerCase();
+  if (paneCmd === "" || SHELL_NAMES.has(paneCmd)) {
+    return { ok: false, reason: "claude_not_running" };
+  }
+  if (!OPENROUTER_API_KEY) {
+    return { ok: false, reason: "no_api_key" };
+  }
   try {
-    obj = JSON.parse(line);
-  } catch {
-    return null;
+    await injectBriefingPrompt(sessionName);
+  } catch (err) {
+    return { ok: false, reason: `tmux_send_failed:${(err as Error).message}` };
   }
-  const message = obj.message;
-  if (!message || message.type !== "message" || message.role !== "assistant") {
-    return null;
-  }
-  const content = message.content;
-  if (typeof content === "string") return content.trim() || null;
-  if (!Array.isArray(content)) return null;
-  const parts: string[] = [];
-  for (const c of content) {
-    if (c && typeof c === "object" && c.type === "text" && typeof c.text === "string") {
-      parts.push(c.text);
-    }
-  }
-  const joined = parts.join("\n").trim();
-  return joined.length > 0 ? joined : null;
+  return { ok: true };
 }
 
-async function readLastAssistantText(jsonlPath: string): Promise<string | null> {
-  let buf: string;
+interface BriefingSynthResult {
+  ok: boolean;
+  reason?: string;
+  audio?: string;
+  mime?: string;
+}
+
+async function runBriefingSynth(text: string): Promise<BriefingSynthResult> {
+  if (!OPENROUTER_API_KEY) return { ok: false, reason: "no_api_key" };
+  if (!text || text.trim().length === 0) return { ok: false, reason: "empty_text" };
   try {
-    buf = await fs.readFile(jsonlPath, "utf8");
-  } catch {
-    return null;
+    const audio = await synthesizeViaOpenRouter(text);
+    return { ok: true, audio: audio.audio, mime: audio.mime };
+  } catch (err) {
+    return { ok: false, reason: `tts_failed:${(err as Error).message}` };
   }
-  const lines = buf.split("\n");
-  for (let i = lines.length - 1; i >= 0; i--) {
-    const ln = lines[i];
-    if (!ln) continue;
-    const text = extractAssistantText(ln);
-    if (text) return text;
-  }
-  return null;
-}
-
-async function getBriefingText(sessionName: string): Promise<{ text: string | null; reason?: string }> {
-  const cwd = await tmuxPanePath(sessionName);
-  if (!cwd) return { text: null, reason: "no_pane_path" };
-  const projectDir = path.join(CLAUDE_PROJECTS_DIR, encodeProjectDir(cwd));
-  const jsonl = await findLatestJsonl(projectDir);
-  if (!jsonl) return { text: null, reason: "no_transcript" };
-  const text = await readLastAssistantText(jsonl);
-  if (!text) return { text: null, reason: "no_assistant_text" };
-  return { text };
 }
 // ──────────────────────────────────────────────────────────────
 
@@ -279,6 +441,25 @@ wss.on("connection", (ws: WebSocket, req: http.IncomingMessage, sessionName: str
   let sessionMissing = false;
   let stderrBuf = "";
 
+  // Recover markdown labels → URLs from the project's transcript JSONL
+  // files (Claude Code's TUI doesn't emit URLs on the wire). The cwd
+  // lookup is async, so the watcher arms a moment after the pty does;
+  // that's fine because labels become clickable on the next poll tick.
+  let linkWatcher: TranscriptLinkWatcher | null = null;
+  void (async () => {
+    const cwd = await getPaneCwd(sessionName);
+    if (!cwd || ws.readyState !== ws.OPEN) return;
+    const dir = cwdToTranscriptDir(cwd);
+    linkWatcher = startTranscriptLinkWatcher(dir, (entries) => {
+      if (ws.readyState !== ws.OPEN) return;
+      try {
+        ws.send(JSON.stringify({ type: "link_map", entries }));
+      } catch {
+        /* socket closed mid-send */
+      }
+    });
+  })();
+
   const onDataDisposable = term.onData((data) => {
     // tmux may print "can't find session: X" then exit with code 1.
     if (!sessionMissing && /can't find session|no sessions|session not found/i.test(data)) {
@@ -336,22 +517,40 @@ wss.on("connection", (ws: WebSocket, req: http.IncomingMessage, sessionName: str
         if (ws.readyState === ws.OPEN) ws.send(JSON.stringify({ type: "pong" }));
         return;
       }
-      if (msg.type === "briefing") {
+      if (msg.type === "briefing_inject") {
         const reqId = (msg as { id?: string }).id;
-        void getBriefingText(sessionName)
+        log("info", "ws.briefing.inject_start", { ip, sessionName });
+        void runBriefingInject(sessionName)
           .then((res) => {
             if (ws.readyState !== ws.OPEN) return;
-            ws.send(
-              JSON.stringify({
-                type: "briefing",
-                id: reqId,
-                text: res.text,
+            if (res.ok) {
+              log("info", "ws.briefing.inject_ok", { ip, sessionName });
+              // Echo the prompt back so the UI can anchor its xterm scrape
+              // on the exact text Claude will display above its answer.
+              ws.send(
+                JSON.stringify({
+                  type: "briefing_inject_ok",
+                  id: reqId,
+                  prompt: BRIEFING_PROMPT,
+                }),
+              );
+            } else {
+              log("info", "ws.briefing.inject_failed", {
+                ip,
+                sessionName,
                 reason: res.reason,
-              }),
-            );
+              });
+              ws.send(
+                JSON.stringify({
+                  type: "briefing_error",
+                  id: reqId,
+                  reason: res.reason,
+                }),
+              );
+            }
           })
           .catch((err) => {
-            log("warn", "ws.briefing.error", {
+            log("warn", "ws.briefing.inject_error", {
               ip,
               sessionName,
               message: (err as Error).message,
@@ -359,9 +558,67 @@ wss.on("connection", (ws: WebSocket, req: http.IncomingMessage, sessionName: str
             if (ws.readyState === ws.OPEN) {
               ws.send(
                 JSON.stringify({
-                  type: "briefing",
+                  type: "briefing_error",
                   id: reqId,
-                  text: null,
+                  reason: "error",
+                }),
+              );
+            }
+          });
+        return;
+      }
+      if (msg.type === "briefing_synth") {
+        const reqId = (msg as { id?: string }).id;
+        const text = (msg as { text?: string }).text ?? "";
+        log("info", "ws.briefing.synth_start", {
+          ip,
+          sessionName,
+          chars: text.length,
+          preview: text.slice(0, 200),
+        });
+        void runBriefingSynth(text)
+          .then((res) => {
+            if (ws.readyState !== ws.OPEN) return;
+            if (res.ok) {
+              log("info", "ws.briefing.synth_ok", {
+                ip,
+                sessionName,
+                bytes: Math.floor(((res.audio?.length ?? 0) * 3) / 4),
+              });
+              ws.send(
+                JSON.stringify({
+                  type: "briefing_audio",
+                  id: reqId,
+                  audio: res.audio,
+                  mime: res.mime,
+                }),
+              );
+            } else {
+              log("warn", "ws.briefing.synth_failed", {
+                ip,
+                sessionName,
+                reason: res.reason,
+              });
+              ws.send(
+                JSON.stringify({
+                  type: "briefing_error",
+                  id: reqId,
+                  reason: res.reason,
+                }),
+              );
+            }
+          })
+          .catch((err) => {
+            log("warn", "ws.briefing.synth_error", {
+              ip,
+              sessionName,
+              message: (err as Error).message,
+            });
+            if (ws.readyState === ws.OPEN) {
+              ws.send(
+                JSON.stringify({
+                  type: "briefing_error",
+                  id: reqId,
                   reason: "error",
                 }),
               );
@@ -393,6 +650,14 @@ wss.on("connection", (ws: WebSocket, req: http.IncomingMessage, sessionName: str
     clearInterval(pingTimer);
     onDataDisposable.dispose();
     onExitDisposable.dispose();
+    if (linkWatcher) {
+      try {
+        linkWatcher.close();
+      } catch {
+        /* noop */
+      }
+      linkWatcher = null;
+    }
     if (!ptyExited) {
       try {
         term.kill();
@@ -423,7 +688,199 @@ wss.on("connection", (ws: WebSocket, req: http.IncomingMessage, sessionName: str
 
 server.listen(PORT, () => {
   log("info", "ws.boot.listen", { port: PORT, allowedOrigins: ALLOWED_ORIGINS });
+  void ensureTmuxExtendedKeys();
 });
+
+// ── Transcript-based markdown-link recovery ─────────────────────────
+// Claude Code's TUI deliberately doesn't put the URL of `[label](url)`
+// onto the wire — only the styled label glyphs reach xterm. The full
+// markdown text *is* recorded in the per-project session transcript at
+// ~/.claude/projects/<cwd-key>/<session>.jsonl, so we tail those JSONL
+// files, pull `[label](url)` pairs out of every assistant turn, and
+// push the mapping over ws as `{type:"link_map", entries:[…]}`. The
+// browser then matches the visible label glyphs to those entries and
+// registers an xterm ILink on top of them.
+//
+// Polling instead of fs.watch — fs.watch on macOS is flaky for tail-
+// like workloads, and the 1.5s latency here is fine (a label only
+// becomes clickable a beat after the assistant message finishes
+// rendering, which is when the user actually reaches for it anyway).
+
+const TRANSCRIPT_POLL_MS = 1500;
+const TRANSCRIPT_LINK_RE = /\[([^\]\n]+?)\]\((https?:\/\/[^\s)]+)\)/g;
+
+function cwdToTranscriptDir(cwd: string): string {
+  // Claude Code maps cwd to ~/.claude/projects/<key>/ where <key> is
+  // the path with `/` replaced by `-`. (Verified against existing
+  // directories on disk.)
+  return path.join(
+    os.homedir(),
+    ".claude",
+    "projects",
+    cwd.replace(/\//g, "-"),
+  );
+}
+
+interface LinkEntry {
+  label: string;
+  url: string;
+}
+
+function extractMdLinks(text: string): LinkEntry[] {
+  const out: LinkEntry[] = [];
+  TRANSCRIPT_LINK_RE.lastIndex = 0;
+  let m: RegExpExecArray | null;
+  while ((m = TRANSCRIPT_LINK_RE.exec(text)) !== null) {
+    out.push({ label: m[1], url: m[2] });
+  }
+  return out;
+}
+
+interface TranscriptLinkWatcher {
+  close: () => void;
+}
+
+async function getPaneCwd(sessionName: string): Promise<string | null> {
+  try {
+    const { stdout } = await execFileP("tmux", [
+      "display-message",
+      "-p",
+      "-t",
+      sessionName,
+      "#{pane_current_path}",
+    ]);
+    const p = stdout.trim();
+    return p.length > 0 ? p : null;
+  } catch {
+    return null;
+  }
+}
+
+function startTranscriptLinkWatcher(
+  dir: string,
+  onBatch: (entries: LinkEntry[]) => void,
+): TranscriptLinkWatcher {
+  const offsets = new Map<string, number>();
+  // Dedupe by label — assistant turns get re-rendered on edits/resumes,
+  // and the same `[캘린더에서 보기](…)` label easily appears in many
+  // transcripts. We only need the *first* URL we see per label.
+  const seenLabels = new Set<string>();
+
+  const emit = (raw: LinkEntry[]) => {
+    const fresh: LinkEntry[] = [];
+    for (const e of raw) {
+      if (seenLabels.has(e.label)) continue;
+      seenLabels.add(e.label);
+      fresh.push(e);
+    }
+    if (fresh.length > 0) onBatch(fresh);
+  };
+
+  const harvestSlice = (text: string) => {
+    const entries: LinkEntry[] = [];
+    for (const line of text.split("\n")) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      let obj: unknown;
+      try {
+        obj = JSON.parse(trimmed);
+      } catch {
+        continue;
+      }
+      const o = obj as {
+        type?: string;
+        message?: { content?: Array<{ type?: string; text?: string }> };
+      };
+      if (o?.type !== "assistant") continue;
+      const content = o?.message?.content;
+      if (!Array.isArray(content)) continue;
+      for (const c of content) {
+        if (c?.type === "text" && typeof c.text === "string") {
+          entries.push(...extractMdLinks(c.text));
+        }
+      }
+    }
+    if (entries.length > 0) emit(entries);
+  };
+
+  const processFile = (fp: string) => {
+    let size: number;
+    try {
+      size = fs.statSync(fp).size;
+    } catch {
+      return;
+    }
+    const off = offsets.get(fp) ?? 0;
+    if (size <= off) {
+      offsets.set(fp, size);
+      return;
+    }
+    let buf: Buffer;
+    let fd: number;
+    try {
+      fd = fs.openSync(fp, "r");
+    } catch {
+      return;
+    }
+    try {
+      buf = Buffer.alloc(size - off);
+      fs.readSync(fd, buf, 0, buf.length, off);
+    } finally {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        /* noop */
+      }
+    }
+    const text = buf.toString("utf8");
+    const lastNl = text.lastIndexOf("\n");
+    if (lastNl < 0) {
+      // Wait for a complete line — don't advance the offset.
+      return;
+    }
+    offsets.set(fp, off + Buffer.byteLength(text.slice(0, lastNl + 1), "utf8"));
+    harvestSlice(text.slice(0, lastNl));
+  };
+
+  // Initial pass: read every existing transcript from byte 0 so the
+  // browser receives labels for prior turns too (scrollback labels stay
+  // clickable).
+  try {
+    if (fs.existsSync(dir)) {
+      for (const f of fs.readdirSync(dir)) {
+        if (!f.endsWith(".jsonl")) continue;
+        const fp = path.join(dir, f);
+        offsets.set(fp, 0);
+        processFile(fp);
+      }
+    }
+  } catch {
+    /* directory missing or unreadable — nothing to do yet */
+  }
+
+  const interval = setInterval(() => {
+    try {
+      if (!fs.existsSync(dir)) return;
+      for (const f of fs.readdirSync(dir)) {
+        if (!f.endsWith(".jsonl")) continue;
+        const fp = path.join(dir, f);
+        if (!offsets.has(fp)) {
+          // New file appeared after we started watching — read from 0.
+          offsets.set(fp, 0);
+        }
+        processFile(fp);
+      }
+    } catch {
+      /* ignore transient FS errors */
+    }
+  }, TRANSCRIPT_POLL_MS);
+
+  return {
+    close: () => {
+      clearInterval(interval);
+    },
+  };
+}
 
 function shutdown(signal: string) {
   log("info", "ws.boot.shutdown", { signal });

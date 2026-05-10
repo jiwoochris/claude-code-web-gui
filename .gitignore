@@ -24,6 +24,9 @@ node_modules
 .next/
 /out/
 
+# build artifact: pdf.js worker copied from node_modules at build time
+ui/public/pdfjs/
+
 # ws-gateway build
 ws-gateway/dist/
 

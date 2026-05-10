@@ -25,9 +25,11 @@ services:
     ports:
       - "2000:3000"
     volumes:
-      # Expose the host project root to the read-only file viewer (§12).
-      # Replace the left-hand path with your actual projects directory.
-      - /Users/sigmine/projects:/workspace:ro
+      # Expose the host project root to the file viewer (§12). Mounted
+      # read-write so authenticated users can drop new files into folders
+      # via the LNB upload UI; existing files are still never modified by
+      # the server (no edit / delete API exists).
+      - /Users/sigmine/projects:/workspace
       # (Linux only) Share the host tmux socket dir so tmux CLI inside the
       # container can talk to the host tmux server. DO NOT enable on macOS —
       # Docker Desktop cannot bridge Unix sockets across its VM boundary and
